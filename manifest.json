@@ -1,0 +1,32 @@
+{
+  "manifest_version": 3,
+  "name": "Fabric Capacity Extension",
+  "description": "An Edge extension for managing Fabric Capacities",
+  "version": "1.0",
+  "permissions": [
+    "identity",
+    "storage",
+    "activeTab",
+    "scripting"
+  ],
+  "host_permissions": [
+    "https://management.azure.com/*",
+    "https://login.microsoftonline.com/*"
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Fabric Capacity Extension",
+    "default_icon": {
+      "16": "icon.png",
+      "32": "icon.png",
+      "48": "icon.png",
+      "128": "icon.png"
+    }
+  },
+  "icons": {
+    "16": "icon.png",
+    "32": "icon.png",
+    "48": "icon.png",
+    "128": "icon.png"
+  }
+}

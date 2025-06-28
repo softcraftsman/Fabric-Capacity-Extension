@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Fabric Capacity Extension</title>
+    <style>
+        body {
+            width: 400px;
+            padding: 16px;
+            margin: 0;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #f3f2f1;
+        }
+
+        h2 {
+            margin: 0 0 16px 0;
+            color: #323130;
+            font-size: 18px;
+            font-weight: 600;
+        }
+
+        .header-container {
+            display: flex;
+            flex-direction: column;
+            margin-bottom: 16px;
+        }
+
+        .header-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .tenant-info {
+            font-size: 12px;
+            color: #605e5c;
+            font-weight: normal;
+            margin-top: 2px;
+        }
+
+        .loading-header {
+            font-size: 12px;
+            color: #605e5c;
+            font-style: italic;
+            display: none;
+        }
+
+        .container {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .controls-container {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .button-container {
+            display: flex;
+            gap: 10px;
+        }
+
+        select {
+            width: 100%;
+            padding: 8px 12px;
+            border: 1px solid #8a8886;
+            border-radius: 2px;
+            font-size: 14px;
+            background-color: white;
+            transition: opacity 0.2s ease;
+        }
+
+        select:disabled {
+            opacity: 0.7;
+            cursor: wait;
+        }
+
+        button {
+            flex: 1;
+            padding: 8px 16px;
+            border: none;
+            border-radius: 2px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+
+        button:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+
+        .start-button {
+            background-color: #107C10;
+            color: white;
+        }
+
+        .start-button:hover:not(:disabled) {
+            background-color: #0e6e0e;
+        }
+
+        .stop-button {
+            background-color: #D83B01;
+            color: white;
+        }
+
+        .stop-button:hover:not(:disabled) {
+            background-color: #c23400;
+        }
+
+        .log-container {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        textarea {
+            width: 100%;
+            min-height: 72px;
+            padding: 8px 12px;
+            border: 1px solid #8a8886;
+            border-radius: 2px;
+            font-family: 'Consolas', 'Courier New', monospace;
+            font-size: 12px;
+            resize: vertical;
+            background-color: white;
+            box-sizing: border-box;
+        }
+
+        .debug-container {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .debug-container input[type="checkbox"] {
+            margin: 0;
+        }
+
+        .debug-container label {
+            font-size: 14px;
+            color: #323130;
+            cursor: pointer;
+            user-select: none;
+        }
+
+        .loading {
+            display: none;
+            text-align: center;
+            color: #605e5c;
+            font-style: italic;
+            padding: 8px;
+        }
+
+        .error {
+            color: #D83B01;
+            font-weight: 600;
+        }
+
+        .success {
+            color: #107C10;
+            font-weight: 600;
+        }
+
+        .status-running {
+            color: #107C10;
+            font-weight: 600;
+        }
+
+        .status-stopped {
+            color: #D83B01;
+            font-weight: 600;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header-container">
+            <h2>Microsoft Fabric</h2>
+            <div class="header-row">
+                <div class="tenant-info" id="tenantInfo" style="display: none;"></div>
+                <div class="loading-header" id="loadingIndicator">Loading capacities...</div>
+            </div>
+        </div>
+        
+        <div class="controls-container">
+            <div style="display: flex; gap: 10px; align-items: center;">
+                <select id="capacitySelect" style="flex: 1;">
+                    <option value="">Select a capacity...</option>
+                </select>
+                <button id="refreshButton" style="flex: 0 0 auto; padding: 8px 12px; background-color: #605e5c; color: white;" title="Refresh capacity list">
+                    ⟳
+                </button>
+            </div>
+            
+            <div class="button-container">
+                <button id="startButton" class="start-button" disabled>Start Capacity</button>
+                <button id="stopButton" class="stop-button" disabled>Stop Capacity</button>
+            </div>
+        </div>
+        
+        <div class="log-container">
+            <textarea id="logArea" rows="20" cols="80" readonly placeholder="Operation logs will appear here..."></textarea>
+            
+            <div class="debug-container">
+                <input type="checkbox" id="debugToggle">
+                <label for="debugToggle">Enable Debug Logging</label>
+            </div>
+        </div>
+    </div>
+
+    <script src="popup.js"></script>
+</body>
+</html>
