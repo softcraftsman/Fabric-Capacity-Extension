@@ -16,6 +16,10 @@ class FabricCapacityManager {
         this.debugToggle = null;
         this.tenantInfo = null;
         this.initialLoadComplete = false;
+        this.skuContainer = null;
+        this.skuSelect = null;
+        this.updateSkuButton = null;
+        this.availableSkus = [];
         
         // API endpoints and configuration
         this.baseUrl = 'https://management.azure.com';
@@ -41,6 +45,9 @@ class FabricCapacityManager {
             
             await this.authenticate();
             await this.loadCapacities();
+            
+            // Start proactive token refresh mechanism
+            this.startTokenRefreshTimer();
         } catch (error) {
             this.logError('Failed to initialize extension', error);
             console.error('Extension initialization failed:', error);
@@ -59,6 +66,9 @@ class FabricCapacityManager {
         this.debugToggle = document.getElementById('debugToggle');
         this.refreshButton = document.getElementById('refreshButton');
         this.tenantInfo = document.getElementById('tenantInfo');
+        this.skuContainer = document.getElementById('skuContainer');
+        this.skuSelect = document.getElementById('skuSelect');
+        this.updateSkuButton = document.getElementById('updateSkuButton');
 
         // Verify all elements were found
         const elements = {
@@ -69,7 +79,10 @@ class FabricCapacityManager {
             loadingIndicator: this.loadingIndicator,
             debugToggle: this.debugToggle,
             refreshButton: this.refreshButton,
-            tenantInfo: this.tenantInfo
+            tenantInfo: this.tenantInfo,
+            skuContainer: this.skuContainer,
+            skuSelect: this.skuSelect,
+            updateSkuButton: this.updateSkuButton
         };
 
         for (const [name, element] of Object.entries(elements)) {
@@ -95,8 +108,8 @@ class FabricCapacityManager {
     setupEventListeners() {
         // Add error handling for event listeners
         try {
-            this.capacitySelect.addEventListener('change', () => {
-                this.onCapacitySelectionChange();
+            this.capacitySelect.addEventListener('change', async () => {
+                await this.onCapacitySelectionChange();
             });
 
             this.refreshButton.addEventListener('click', async () => {
@@ -116,6 +129,14 @@ class FabricCapacityManager {
                 this.debugMode = e.target.checked;
                 chrome.storage.local.set({ debugMode: this.debugMode });
                 this.log(`Debug logging ${this.debugMode ? 'enabled' : 'disabled'}`);
+            });
+
+            this.updateSkuButton.addEventListener('click', () => {
+                this.updateCapacitySku();
+            });
+
+            this.skuSelect.addEventListener('change', () => {
+                this.onSkuSelectionChange();
             });
 
             // Add double-click on title to clear authentication (for testing/troubleshooting)
@@ -152,19 +173,34 @@ class FabricCapacityManager {
                 this.updateTenantDisplay(cachedToken);
                 this.log('Using cached authentication token');
                 this.debugLog('Cached token is valid');
+                
+                // Try to extend token lifetime silently in background
+                setTimeout(async () => {
+                    try {
+                        const refreshedTokenInfo = await this.performSilentAuth();
+                        if (refreshedTokenInfo && refreshedTokenInfo.accessToken !== cachedToken) {
+                            this.accessToken = refreshedTokenInfo.accessToken;
+                            await this.cacheToken(refreshedTokenInfo.accessToken, refreshedTokenInfo.expiresIn);
+                            this.debugLog('Background token refresh successful');
+                        }
+                    } catch (error) {
+                        this.debugLog('Background token refresh failed: ' + error.message);
+                    }
+                }, 1000); // Delay to avoid blocking initial load
+                
                 return cachedToken;
             }
 
             // Perform OAuth2 flow using launchWebAuthFlow
-            const token = await this.performOAuth2Flow();
+            const tokenInfo = await this.performOAuth2Flow();
             
-            this.accessToken = token;
-            this.updateTenantDisplay(token);
-            await this.cacheToken(token);
+            this.accessToken = tokenInfo.accessToken;
+            this.updateTenantDisplay(tokenInfo.accessToken);
+            await this.cacheToken(tokenInfo.accessToken, tokenInfo.expiresIn);
             this.log('Authentication successful');
             this.debugLog('New access token obtained and cached');
             
-            return token;
+            return tokenInfo.accessToken;
         } catch (error) {
             this.logError('Authentication error', error);
             throw error;
@@ -219,8 +255,8 @@ class FabricCapacityManager {
                 this.debugLog(`OAuth2 response URL: ${responseUrl}`);
 
                 try {
-                    const token = this.extractTokenFromUrl(responseUrl, state);
-                    resolve(token);
+                    const tokenInfo = this.extractTokenFromUrl(responseUrl, state);
+                    resolve(tokenInfo);
                 } catch (error) {
                     this.logError('Failed to extract token from response', error);
                     reject(error);
@@ -261,7 +297,12 @@ class FabricCapacityManager {
         const tokenType = params.get('token_type');
         this.debugLog(`Token type: ${tokenType}, expires in: ${expiresIn} seconds`);
 
-        return accessToken;
+        // Return both token and expiry information
+        return {
+            accessToken: accessToken,
+            expiresIn: expiresIn ? parseInt(expiresIn) : 3600, // Default to 1 hour if not provided
+            tokenType: tokenType
+        };
     }
 
     /**
@@ -274,18 +315,33 @@ class FabricCapacityManager {
     }
 
     /**
+     * Generate a hash of the token for validation purposes (without storing the actual token)
+     */
+    generateTokenHash(token) {
+        // Simple hash function for token validation
+        let hash = 0;
+        if (token.length === 0) return hash.toString();
+        for (let i = 0; i < Math.min(token.length, 100); i++) { // Only hash first 100 chars for performance
+            const char = token.charCodeAt(i);
+            hash = ((hash << 5) - hash) + char;
+            hash = hash & hash; // Convert to 32-bit integer
+        }
+        return Math.abs(hash).toString();
+    }
+
+    /**
      * Get cached authentication token
      */
     async getCachedToken() {
         return new Promise((resolve) => {
-            chrome.storage.local.get(['accessToken', 'tokenExpiry'], (result) => {
+            chrome.storage.local.get(['accessToken', 'tokenExpiry', 'sessionInfo'], (result) => {
                 if (chrome.runtime.lastError) {
                     this.debugLog('Failed to get cached token: ' + chrome.runtime.lastError.message);
                     resolve(null);
                     return;
                 }
 
-                const { accessToken, tokenExpiry } = result;
+                const { accessToken, tokenExpiry, sessionInfo } = result;
                 
                 if (!accessToken || !tokenExpiry) {
                     this.debugLog('No cached token found');
@@ -293,18 +349,36 @@ class FabricCapacityManager {
                     return;
                 }
 
-                // Check if token is expired (with 5-minute buffer)
+                // Validate session integrity if session info exists
+                if (sessionInfo && accessToken) {
+                    const currentTokenHash = this.generateTokenHash(accessToken);
+                    if (sessionInfo.tokenHash !== currentTokenHash) {
+                        this.debugLog('Cached token integrity check failed');
+                        resolve(null);
+                        return;
+                    }
+                }
+
+                // Check if token is expired (with 2-minute buffer)
                 const now = Date.now();
                 const expiryTime = parseInt(tokenExpiry);
-                const bufferTime = 5 * 60 * 1000; // 5 minutes in milliseconds
+                const bufferTime = 2 * 60 * 1000; // 2 minutes in milliseconds
+                const timeUntilExpiry = expiryTime - now;
+                const timeUntilExpiryMinutes = Math.floor(timeUntilExpiry / (60 * 1000));
 
                 if (now >= (expiryTime - bufferTime)) {
-                    this.debugLog('Cached token is expired');
+                    this.debugLog(`Cached token is expired or will expire soon (${timeUntilExpiryMinutes} minutes remaining)`);
                     resolve(null);
                     return;
                 }
 
-                this.debugLog('Found valid cached token');
+                if (sessionInfo) {
+                    const sessionAge = Math.floor((now - sessionInfo.cachedAt) / (60 * 1000));
+                    this.debugLog(`Found valid cached token (expires in ${timeUntilExpiryMinutes} minutes, session age: ${sessionAge} minutes)`);
+                } else {
+                    this.debugLog(`Found valid cached token (expires in ${timeUntilExpiryMinutes} minutes)`);
+                }
+                
                 resolve(accessToken);
             });
         });
@@ -313,19 +387,33 @@ class FabricCapacityManager {
     /**
      * Cache authentication token with expiry
      */
-    async cacheToken(token) {
-        // Azure AD tokens typically expire in 1 hour
-        const expiryTime = Date.now() + (60 * 60 * 1000); // 1 hour from now
+    async cacheToken(token, expiresInSeconds) {
+        // Use the actual expiry time from Azure AD response
+        // Default to 1 hour if not provided
+        const expirySeconds = expiresInSeconds || 3600;
+        const expiryTime = Date.now() + (expirySeconds * 1000);
+        
+        // Extract additional session info for better persistence
+        const tokenData = this.decodeJwtToken(token);
+        const sessionInfo = {
+            cachedAt: Date.now(),
+            tenantId: tokenData?.tid,
+            userPrincipalName: tokenData?.upn || tokenData?.unique_name,
+            tokenHash: this.generateTokenHash(token) // For validation without storing full token
+        };
+        
+        this.debugLog(`Caching token with expiry in ${expirySeconds} seconds`);
         
         return new Promise((resolve) => {
             chrome.storage.local.set({
                 accessToken: token,
-                tokenExpiry: expiryTime.toString()
+                tokenExpiry: expiryTime.toString(),
+                sessionInfo: sessionInfo
             }, () => {
                 if (chrome.runtime.lastError) {
                     this.debugLog('Failed to cache token: ' + chrome.runtime.lastError.message);
                 } else {
-                    this.debugLog('Token cached successfully');
+                    this.debugLog('Token cached successfully with session info');
                 }
                 resolve();
             });
@@ -358,7 +446,7 @@ class FabricCapacityManager {
      */
     async clearCachedAuth() {
         return new Promise((resolve) => {
-            chrome.storage.local.remove(['accessToken', 'tokenExpiry'], () => {
+            chrome.storage.local.remove(['accessToken', 'tokenExpiry', 'sessionInfo'], () => {
                 this.debugLog('Cached authentication data cleared');
                 // Clear tenant display
                 if (this.tenantInfo) {
@@ -368,6 +456,136 @@ class FabricCapacityManager {
                 resolve();
             });
         });
+    }
+
+    /**
+     * Handle token expiry with automatic silent refresh attempt
+     */
+    async handleTokenExpiry() {
+        try {
+            this.debugLog('Attempting silent token refresh...');
+            
+            // Try to perform a silent authentication
+            const tokenInfo = await this.performSilentAuth();
+            if (tokenInfo) {
+                this.accessToken = tokenInfo.accessToken;
+                await this.cacheToken(tokenInfo.accessToken, tokenInfo.expiresIn);
+                this.debugLog('Silent token refresh successful');
+                return tokenInfo.accessToken;
+            }
+        } catch (error) {
+            this.debugLog('Silent token refresh failed: ' + error.message);
+        }
+        
+        // If silent refresh fails, clear the token and require re-authentication
+        this.accessToken = null;
+        await this.clearCachedAuth();
+        return null;
+    }
+
+    /**
+     * Attempt silent authentication (non-interactive)
+     */
+    async performSilentAuth() {
+        return new Promise((resolve, reject) => {
+            // Azure AD OAuth2 endpoints for silent auth
+            const tenantId = 'common';
+            const clientId = 'b2f9922d-47b3-45de-be16-72911e143fa4';
+            const redirectUri = chrome.identity.getRedirectURL();
+            const scope = encodeURIComponent(this.scope);
+            const responseType = 'token';
+            const state = this.generateState();
+
+            // Construct authorization URL with prompt=none for silent auth
+            const authUrl = `https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/authorize` +
+                `?client_id=${clientId}` +
+                `&response_type=${responseType}` +
+                `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+                `&scope=${scope}` +
+                `&state=${state}` +
+                `&response_mode=fragment` +
+                `&prompt=none`;
+
+            this.debugLog(`Attempting silent auth with URL: ${authUrl}`);
+
+            chrome.identity.launchWebAuthFlow({
+                url: authUrl,
+                interactive: false  // Non-interactive for silent auth
+            }, (responseUrl) => {
+                if (chrome.runtime.lastError) {
+                    this.debugLog('Silent auth failed: ' + chrome.runtime.lastError.message);
+                    resolve(null);
+                    return;
+                }
+
+                if (!responseUrl) {
+                    this.debugLog('No response URL from silent auth');
+                    resolve(null);
+                    return;
+                }
+
+                try {
+                    const tokenInfo = this.extractTokenFromUrl(responseUrl, state);
+                    resolve(tokenInfo);
+                } catch (error) {
+                    this.debugLog('Failed to extract token from silent auth response: ' + error.message);
+                    resolve(null);
+                }
+            });
+        });
+    }
+
+    /**
+     * Start proactive token refresh timer
+     */
+    startTokenRefreshTimer() {
+        // Check token status every 10 minutes
+        const refreshInterval = setInterval(async () => {
+            try {
+                const cachedToken = await this.getCachedToken();
+                if (!cachedToken) {
+                    // No valid token, stop the timer
+                    this.debugLog('No valid token found, stopping proactive refresh timer');
+                    clearInterval(refreshInterval);
+                    return;
+                }
+                
+                // Get current token expiry info
+                const result = await new Promise((resolve) => {
+                    chrome.storage.local.get(['tokenExpiry', 'sessionInfo'], resolve);
+                });
+                
+                if (result.tokenExpiry) {
+                    const expiryTime = parseInt(result.tokenExpiry);
+                    const now = Date.now();
+                    const timeUntilExpiry = expiryTime - now;
+                    const minutesUntilExpiry = Math.floor(timeUntilExpiry / (60 * 1000));
+                    
+                    // If token expires in less than 15 minutes, try to refresh
+                    if (minutesUntilExpiry < 15 && minutesUntilExpiry > 0) {
+                        this.debugLog(`Token expires in ${minutesUntilExpiry} minutes, attempting proactive refresh`);
+                        
+                        const refreshedTokenInfo = await this.performSilentAuth();
+                        if (refreshedTokenInfo) {
+                            this.accessToken = refreshedTokenInfo.accessToken;
+                            await this.cacheToken(refreshedTokenInfo.accessToken, refreshedTokenInfo.expiresIn);
+                            this.debugLog('Proactive token refresh successful');
+                            
+                            // Update tenant display with new token
+                            this.updateTenantDisplay(refreshedTokenInfo.accessToken);
+                        } else {
+                            this.debugLog('Proactive token refresh failed, user will need to re-authenticate');
+                        }
+                    } else if (minutesUntilExpiry > 0) {
+                        this.debugLog(`Token still valid for ${minutesUntilExpiry} minutes`);
+                    }
+                }
+            } catch (error) {
+                this.debugLog('Proactive token refresh check failed: ' + error.message);
+            }
+        }, 10 * 60 * 1000); // Every 10 minutes
+        
+        this.debugLog('Started proactive token refresh timer (checks every 10 minutes)');
     }
 
     /**
@@ -426,6 +644,7 @@ class FabricCapacityManager {
             // Show subtle loading without full loading message
             this.capacitySelect.disabled = true;
             this.refreshButton.disabled = true;
+            this.skuContainer.style.display = 'none';
             
             // Get fresh capacity data
             const refreshedCapacities = [];
@@ -459,7 +678,7 @@ class FabricCapacityManager {
                 const newIndex = this.capacities.findIndex(c => c.id === selectedCapacityId);
                 if (newIndex !== -1) {
                     this.capacitySelect.value = newIndex.toString();
-                    this.onCapacitySelectionChange();
+                    await this.onCapacitySelectionChange();
                 }
             }
 
@@ -545,7 +764,8 @@ class FabricCapacityManager {
                                    state === 'Paused' ? '(Stopped)' : 
                                    `(${state})`;
                 
-                option.textContent = `${capacity.name} ${stateDisplay}`;
+                const sku = capacity.sku?.name || 'Unknown SKU';
+                option.textContent = `${capacity.name} - ${sku} ${stateDisplay}`;
                 
                 // Add visual styling based on state
                 if (state === 'Active') {
@@ -568,12 +788,13 @@ class FabricCapacityManager {
     /**
      * Handle capacity selection change
      */
-    onCapacitySelectionChange() {
+    async onCapacitySelectionChange() {
         const selectedIndex = this.capacitySelect.value;
         
         if (!selectedIndex || selectedIndex === '') {
             this.startButton.disabled = true;
             this.stopButton.disabled = true;
+            this.skuContainer.style.display = 'none';
             return;
         }
 
@@ -584,7 +805,12 @@ class FabricCapacityManager {
         this.startButton.disabled = (state === 'Active');
         this.stopButton.disabled = (state === 'Paused');
 
-        this.log(`Selected capacity: ${capacity.name} (${state})`);
+        // Show SKU container and load available SKUs
+        this.skuContainer.style.display = 'block';
+        await this.loadAvailableSkus(capacity);
+        await this.populateSkuDropdown(capacity);
+
+        this.log(`Selected capacity: ${capacity.name} (${state}) - SKU: ${capacity.sku?.name || 'Unknown'}`);
         this.debugLog(`Capacity details: ${JSON.stringify(capacity, null, 2)}`);
     }
 
@@ -613,7 +839,7 @@ class FabricCapacityManager {
         
         try {
             this.log(`${operationName} capacity ${capacity.name}...`);
-            this.setButtonsEnabled(false);
+            await this.setButtonsEnabled(false);
 
             const url = `${this.baseUrl}${capacity.id}/${operation}?api-version=${this.fabricApiVersion}`;
             
@@ -629,7 +855,176 @@ class FabricCapacityManager {
         } catch (error) {
             this.logError(`Failed to ${operation} capacity ${capacity.name}`, error);
         } finally {
-            this.setButtonsEnabled(true);
+            await this.setButtonsEnabled(true);
+        }
+    }
+
+    /**
+     * Load available SKUs for Fabric capacities
+     */
+    async loadAvailableSkus(capacity) {
+        try {
+            this.debugLog('Loading available SKUs...');
+            
+            // Common Fabric capacity SKUs based on Azure documentation
+            // These are the standard SKUs available for Microsoft Fabric
+            this.availableSkus = [
+                { name: 'F2', displayName: 'F2 (2 vCores, 4 GB RAM)', description: 'Small workloads' },
+                { name: 'F4', displayName: 'F4 (4 vCores, 8 GB RAM)', description: 'Development and testing' },
+                { name: 'F8', displayName: 'F8 (8 vCores, 16 GB RAM)', description: 'Light production workloads' },
+                { name: 'F16', displayName: 'F16 (16 vCores, 32 GB RAM)', description: 'Medium production workloads' },
+                { name: 'F32', displayName: 'F32 (32 vCores, 64 GB RAM)', description: 'Heavy production workloads' },
+                { name: 'F64', displayName: 'F64 (64 vCores, 128 GB RAM)', description: 'Enterprise workloads' },
+                { name: 'F128', displayName: 'F128 (128 vCores, 256 GB RAM)', description: 'Large enterprise workloads' },
+                { name: 'F256', displayName: 'F256 (256 vCores, 512 GB RAM)', description: 'Very large enterprise workloads' },
+                { name: 'F512', displayName: 'F512 (512 vCores, 1024 GB RAM)', description: 'Maximum capacity workloads' }
+            ];
+
+            // Alternatively, we could fetch available SKUs from Azure API
+            // const subscriptionId = capacity.subscriptionId;
+            // const location = capacity.location;
+            // const url = `${this.baseUrl}/subscriptions/${subscriptionId}/providers/Microsoft.Fabric/locations/${location}/skus?api-version=${this.fabricApiVersion}`;
+            // const response = await this.makeApiCall(url);
+            // this.availableSkus = response.value || [];
+
+            this.debugLog(`Loaded ${this.availableSkus.length} available SKUs`);
+        } catch (error) {
+            this.logError('Failed to load available SKUs', error);
+            // Use default SKUs if API call fails
+            this.availableSkus = [
+                { name: 'F2', displayName: 'F2', description: 'Small' },
+                { name: 'F4', displayName: 'F4', description: 'Medium' },
+                { name: 'F8', displayName: 'F8', description: 'Large' }
+            ];
+        }
+    }
+
+    /**
+     * Populate the SKU dropdown with available options
+     */
+    async populateSkuDropdown(capacity) {
+        try {
+            const currentSku = capacity.sku?.name || 'Unknown';
+            
+            // Clear existing options
+            this.skuSelect.innerHTML = '';
+            
+            // Add current SKU as selected option
+            const currentOption = document.createElement('option');
+            currentOption.value = currentSku;
+            currentOption.textContent = `Current: ${currentSku}`;
+            currentOption.selected = true;
+            this.skuSelect.appendChild(currentOption);
+            
+            // Add separator
+            const separator = document.createElement('option');
+            separator.disabled = true;
+            separator.textContent = '─────────────────';
+            this.skuSelect.appendChild(separator);
+            
+            // Add available SKUs
+            this.availableSkus.forEach(sku => {
+                if (sku.name !== currentSku) {
+                    const option = document.createElement('option');
+                    option.value = sku.name;
+                    option.textContent = sku.displayName || sku.name;
+                    option.title = sku.description || '';
+                    this.skuSelect.appendChild(option);
+                }
+            });
+            
+            // Reset update button state
+            this.updateSkuButton.disabled = true;
+            
+            this.debugLog(`Populated SKU dropdown with current SKU: ${currentSku}`);
+        } catch (error) {
+            this.logError('Failed to populate SKU dropdown', error);
+        }
+    }
+
+    /**
+     * Handle SKU selection change
+     */
+    onSkuSelectionChange() {
+        const selectedSku = this.skuSelect.value;
+        const selectedIndex = this.capacitySelect.value;
+        
+        if (!selectedIndex || selectedIndex === '') return;
+        
+        const capacity = this.capacities[parseInt(selectedIndex)];
+        const currentSku = capacity.sku?.name || 'Unknown';
+        
+        // Enable update button only if a different SKU is selected
+        this.updateSkuButton.disabled = (selectedSku === currentSku || selectedSku.startsWith('Current:'));
+        
+        if (selectedSku !== currentSku && !selectedSku.startsWith('Current:')) {
+            this.debugLog(`SKU change selected: ${currentSku} → ${selectedSku}`);
+        }
+    }
+
+    /**
+     * Update the capacity SKU
+     */
+    async updateCapacitySku() {
+        const selectedIndex = this.capacitySelect.value;
+        const selectedSku = this.skuSelect.value;
+        
+        if (!selectedIndex || selectedIndex === '' || !selectedSku) return;
+        
+        const capacity = this.capacities[parseInt(selectedIndex)];
+        const currentSku = capacity.sku?.name || 'Unknown';
+        
+        if (selectedSku === currentSku || selectedSku.startsWith('Current:')) {
+            this.log('No SKU change required');
+            return;
+        }
+        
+        // Check if capacity is running - SKU changes typically require the capacity to be stopped
+        const state = capacity.properties?.state || 'Unknown';
+        if (state === 'Active') {
+            const proceed = confirm(
+                `Changing the SKU typically requires stopping the capacity first.\n\n` +
+                `Current: ${currentSku}\nNew: ${selectedSku}\n\n` +
+                `Do you want to proceed? The capacity may be temporarily unavailable.`
+            );
+            if (!proceed) return;
+        }
+        
+        try {
+            this.log(`Updating capacity ${capacity.name} SKU from ${currentSku} to ${selectedSku}...`);
+            await this.setButtonsEnabled(false);
+            this.updateSkuButton.disabled = true;
+            this.skuSelect.disabled = true;
+
+            // Prepare the update payload
+            const updatePayload = {
+                sku: {
+                    name: selectedSku
+                }
+            };
+
+            const url = `${this.baseUrl}${capacity.id}?api-version=${this.fabricApiVersion}`;
+            
+            // Use PATCH method to update the capacity
+            await this.makeApiCall(url, 'PATCH', updatePayload);
+            
+            this.logSuccess(`SKU update initiated for ${capacity.name}: ${currentSku} → ${selectedSku}`);
+            
+            // Refresh the capacity list to update SKU information after a delay
+            setTimeout(async () => {
+                await this.refreshCapacities();
+                // Re-select the same capacity to update the SKU dropdown
+                if (this.capacitySelect.value) {
+                    await this.onCapacitySelectionChange();
+                }
+            }, 3000);
+
+        } catch (error) {
+            this.logError(`Failed to update SKU for capacity ${capacity.name}`, error);
+        } finally {
+            await this.setButtonsEnabled(true);
+            this.skuSelect.disabled = false;
+            // Update button will be re-enabled by onSkuSelectionChange if needed
         }
     }
 
@@ -662,36 +1057,65 @@ class FabricCapacityManager {
             this.debugLog(`API call failed: ${response.status} ${response.statusText} - ${errorText}`);
             
             if (response.status === 401) {
-                // Token might be expired, clear cache and try to re-authenticate
-                this.debugLog('Token expired, attempting to re-authenticate');
-                await this.clearCachedAuth();
-                this.accessToken = null;
-                await this.authenticate();
+                // Token might be expired, try silent refresh first
+                this.debugLog('Token expired, attempting silent refresh');
                 
-                // Retry the original request with new token
-                options.headers['Authorization'] = `Bearer ${this.accessToken}`;
-                const retryResponse = await fetch(url, options);
+                const refreshedToken = await this.handleTokenExpiry();
                 
-                if (!retryResponse.ok) {
-                    const retryErrorText = await retryResponse.text();
-                    this.debugLog(`Retry API call failed: ${retryResponse.status} ${retryResponse.statusText} - ${retryErrorText}`);
-                    throw new Error(`API call failed after retry: ${retryResponse.status} ${retryResponse.statusText}`);
+                if (refreshedToken) {
+                    // Retry with refreshed token
+                    options.headers['Authorization'] = `Bearer ${refreshedToken}`;
+                    const retryResponse = await fetch(url, options);
+                    
+                    if (!retryResponse.ok) {
+                        const retryErrorText = await retryResponse.text();
+                        this.debugLog(`Retry API call failed after silent refresh: ${retryResponse.status} ${retryResponse.statusText} - ${retryErrorText}`);
+                        throw new Error(`API call failed after silent refresh: ${retryResponse.status} ${retryResponse.statusText}`);
+                    }
+                    
+                    // Handle successful retry response
+                    if (method === 'POST' && retryResponse.status === 202) {
+                        return { success: true };
+                    }
+                    if (method === 'PATCH' && (retryResponse.status === 200 || retryResponse.status === 202)) {
+                        return { success: true };
+                    }
+                    
+                    const retryResponseText = await retryResponse.text();
+                    return retryResponseText ? JSON.parse(retryResponseText) : {};
+                } else {
+                    // Silent refresh failed, require interactive authentication
+                    this.debugLog('Silent refresh failed, requiring interactive authentication');
+                    await this.authenticate();
+                    
+                    // Retry the original request with new token
+                    options.headers['Authorization'] = `Bearer ${this.accessToken}`;
+                    const retryResponse = await fetch(url, options);
+                    
+                    if (!retryResponse.ok) {
+                        const retryErrorText = await retryResponse.text();
+                        this.debugLog(`Retry API call failed after interactive auth: ${retryResponse.status} ${retryResponse.statusText} - ${retryErrorText}`);
+                        throw new Error(`API call failed after interactive authentication: ${retryResponse.status} ${retryResponse.statusText}`);
+                    }
+                    
+                    // Handle successful retry response
+                    if (method === 'POST' && retryResponse.status === 202) {
+                        return { success: true };
+                    }
+                    if (method === 'PATCH' && (retryResponse.status === 200 || retryResponse.status === 202)) {
+                        return { success: true };
+                    }
+                    
+                    const retryResponseText = await retryResponse.text();
+                    return retryResponseText ? JSON.parse(retryResponseText) : {};
                 }
-                
-                // Handle successful retry response
-                if (method === 'POST' && retryResponse.status === 202) {
-                    return { success: true };
-                }
-                
-                const retryResponseText = await retryResponse.text();
-                return retryResponseText ? JSON.parse(retryResponseText) : {};
             }
             
             throw new Error(`API call failed: ${response.status} ${response.statusText}`);
         }
 
-        // Handle empty responses for POST operations
-        if (method === 'POST' && response.status === 202) {
+        // Handle empty responses for POST and PATCH operations
+        if ((method === 'POST' || method === 'PATCH') && (response.status === 200 || response.status === 202)) {
             return { success: true };
         }
 
@@ -702,14 +1126,15 @@ class FabricCapacityManager {
     /**
      * Enable/disable operation buttons
      */
-    setButtonsEnabled(enabled) {
+    async setButtonsEnabled(enabled) {
         if (enabled) {
-            this.onCapacitySelectionChange(); // Re-evaluate button states
+            await this.onCapacitySelectionChange(); // Re-evaluate button states
             this.refreshButton.disabled = false;
         } else {
             this.startButton.disabled = true;
             this.stopButton.disabled = true;
             this.refreshButton.disabled = true;
+            // Note: updateSkuButton is handled separately in updateCapacitySku method
         }
     }
 

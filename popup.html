@@ -112,6 +112,48 @@
             background-color: #c23400;
         }
 
+        .update-sku-button {
+            background-color: #0078d4;
+            color: white;
+        }
+
+        .update-sku-button:hover:not(:disabled) {
+            background-color: #106ebe;
+        }
+
+        .update-sku-button:disabled {
+            background-color: #8a8886;
+            color: #a19f9d;
+        }
+
+        .sku-container {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            padding: 12px;
+            background-color: #faf9f8;
+            border: 1px solid #e1dfdd;
+            border-radius: 2px;
+            margin: 8px 0;
+        }
+
+        .sku-container label {
+            font-size: 14px;
+            color: #323130;
+            font-weight: 600;
+            margin: 0;
+        }
+
+        .current-sku {
+            font-size: 14px;
+            color: #0078d4;
+            font-weight: 600;
+            background-color: #f3f9fd;
+            padding: 4px 8px;
+            border-radius: 2px;
+            border: 1px solid #deecf9;
+        }
+
         .log-container {
             display: flex;
             flex-direction: column;
@@ -195,6 +237,18 @@
                 <button id="refreshButton" style="flex: 0 0 auto; padding: 8px 12px; background-color: #605e5c; color: white;" title="Refresh capacity list">
                     ⟳
                 </button>
+            </div>
+            
+            <div id="skuContainer" style="display: none;">
+                <div style="display: flex; gap: 10px; align-items: center; margin-top: 10px;">
+                    <label for="skuSelect" style="font-size: 14px; color: #323130; font-weight: 600; min-width: 80px;">Current SKU:</label>
+                    <select id="skuSelect" style="flex: 1;">
+                        <option value="">Loading SKUs...</option>
+                    </select>
+                    <button id="updateSkuButton" style="flex: 0 0 auto; padding: 8px 12px; background-color: #0078d4; color: white;" disabled>
+                        Update SKU
+                    </button>
+                </div>
             </div>
             
             <div class="button-container">

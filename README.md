@@ -7,11 +7,13 @@ A Microsoft Edge browser extension that provides a GUI interface for managing Mi
 - 🔐 **Azure AD Authentication** - Secure OAuth2 flow using `chrome.identity.launchWebAuthFlow` with token caching
 - 🌐 **Cross-Subscription Discovery** - Automatically finds Fabric capacities across all your subscriptions
 - ▶️ **Start/Stop Controls** - Easy one-click capacity management
-- 📊 **Real-time Status** - Live status updates with automatic refresh when dropdown is accessed
+- � **SKU Management** - View current SKU and change capacity sizes (F2, F4, F8, F16, F32, F64, F128, F256, F512)
+- �📊 **Real-time Status** - Live status updates with automatic refresh when dropdown is accessed
 - 📝 **Comprehensive Logging** - Operation logs with optional debug mode
 - 🎨 **Microsoft Design** - Clean UI following Microsoft design principles
-- 💾 **Token Caching** - Intelligent token management with automatic refresh
-- 🔄 **Auto-refresh** - Capacity status automatically updates when dropdown is selected
+- 💾 **Smart Token Caching** - Intelligent token management with automatic refresh and extended session persistence
+- 🔄 **Proactive Token Refresh** - Background token renewal to minimize login interruptions
+- ⏰ **Extended Sessions** - Stay logged in for hours with automatic silent authentication
 
 ## Installation
 
@@ -55,6 +57,7 @@ A Microsoft Edge browser extension that provides a GUI interface for managing Mi
    - **Auto-refresh**: Status is automatically updated each time you click on the dropdown
    - Running capacities show as "(Running)" in green
    - Stopped capacities show as "(Stopped)" in red
+   - Current SKU is displayed (e.g., "MyCapacity - F8 (Running)")
    - Selection is preserved after status refreshes
 
 2. **Start a Capacity**: 
@@ -69,11 +72,28 @@ A Microsoft Edge browser extension that provides a GUI interface for managing Mi
    - Monitor the log area for operation status
    - Status will auto-refresh after 2 seconds
 
+4. **Change Capacity SKU**:
+   - Select any capacity to see the SKU management section
+   - View the current SKU in the dropdown (shows as "Current: F8")
+   - Select a new SKU from available options (F2, F4, F8, F16, F32, F64, F128, F256, F512)
+   - Click "Update SKU" to initiate the change
+   - **Note**: SKU changes may require stopping the capacity first
+   - The extension will prompt for confirmation if changing a running capacity
+   - Status will auto-refresh after 3 seconds to show the new SKU
+
 ### Debug Mode
 
 - Enable "Enable Debug Logging" for detailed API call information
 - Useful for troubleshooting authentication or API issues
 - Debug preference is saved between sessions
+
+### Enhanced Authentication Features
+
+- **Extended Login Sessions**: Smart token management keeps you logged in for hours instead of requiring frequent re-authentication
+- **Proactive Token Refresh**: Background process automatically renews tokens 15 minutes before expiry
+- **Silent Authentication**: Seamlessly refreshes tokens without interrupting your work
+- **Session Persistence**: Maintains authentication across browser sessions when possible
+- **Intelligent Caching**: Stores token metadata for better session validation and management
 
 ## Architecture
 
@@ -93,8 +113,9 @@ Edge Extension ←→ Azure AD (OAuth2) ←→ Azure Management API ←→ Fabri
 - **Authentication**: Uses `chrome.identity.launchWebAuthFlow` with Azure AD OAuth2 v2.0 endpoints
 - **Token Management**: Intelligent caching with automatic expiry detection and refresh
 - **Subscription Discovery**: Lists all accessible Azure subscriptions
-- **Capacity Discovery**: Queries Microsoft.Fabric/capacities across subscriptions
+- **Capacity Discovery**: Queries Microsoft.Fabric/capacities across subscriptions with SKU information
 - **Capacity Control**: Uses suspend/resume endpoints for start/stop operations
+- **SKU Management**: Uses PATCH endpoint to update capacity SKU size
 
 ## Permissions
 
@@ -105,6 +126,16 @@ The extension requires the following permissions:
 - `activeTab`: For extension popup functionality
 - `scripting`: For extension operations
 - `https://management.azure.com/*`: For Azure API access
+
+### Required Azure Permissions
+
+For full functionality, your Azure account needs:
+
+- **Reader**: To discover and view Fabric capacities
+- **Contributor** or **Fabric Administrator**: To start/stop capacities
+- **Contributor** or **Fabric Administrator**: To change capacity SKU sizes
+
+**Note**: SKU changes are significant operations that may affect billing and require elevated permissions.
 
 ## API Versions
 
@@ -143,6 +174,14 @@ The extension includes comprehensive error handling for:
 - Enable debug logging to see detailed error information
 - Check Azure service health for any outages
 - Verify your Azure permissions include Fabric resource management
+
+### SKU Change Issues
+
+- Ensure you have Contributor or Fabric Administrator permissions
+- Some SKU changes may require stopping the capacity first
+- SKU availability may vary by Azure region
+- Check Azure quotas for the target SKU size
+- Verify billing account can support the new SKU pricing
 
 ## Development
 

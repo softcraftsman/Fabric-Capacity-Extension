@@ -21,8 +21,11 @@ Create a Microsoft Edge browser extension that provides a GUI interface for mana
 - **Loading Indicator**: Right-justified loading message next to tenant info
 
 ### Main Controls
-- **Capacity Selector**: Dropdown showing available Fabric capacities with status indicators
+- **Capacity Selector**: Dropdown showing available Fabric capacities with status indicators and SKU information
 - **Refresh Button**: Manual refresh button (⟳ symbol) next to dropdown
+- **SKU Management Section**: Hidden by default, shown when capacity is selected
+  - **SKU Dropdown**: Shows current SKU and available options
+  - **Update SKU Button**: Blue button to initiate SKU changes
 - **Action Buttons**: "Start Capacity" and "Stop Capacity" buttons
 
 ### Logging Section
@@ -80,9 +83,10 @@ Create a Microsoft Edge browser extension that provides a GUI interface for mana
 
 ### API Operations
 1. **List Subscriptions**: Get all accessible Azure subscriptions
-2. **List Capacities**: Query Fabric capacities across all subscriptions
+2. **List Capacities**: Query Fabric capacities across all subscriptions with SKU information
 3. **Start Capacity**: POST to `{capacityId}/resume`
 4. **Stop Capacity**: POST to `{capacityId}/suspend`
+5. **Update SKU**: PATCH to `{capacityId}` with new SKU in request body
 
 ### Error Handling
 - Handle 404 for subscriptions without Fabric provider
@@ -105,100 +109,114 @@ Create a Microsoft Edge browser extension that provides a GUI interface for mana
 - UI updates for authentication state
 
 #### 3. Capacity Discovery and Management
-- Cross-subscription capacity discovery
-- Real-time status display in dropdown
+- Cross-subscription capacity discovery with SKU information display
+- Real-time status display in dropdown with SKU details
 - State-based button enabling/disabling
 - Manual refresh capability
+- SKU management interface that appears when capacity is selected
 
-#### 4. Operation Logging
-- Timestamped logging to textarea
-- Debug mode toggle with persistent preference
-- Success/error message differentiation
-- Fallback console logging
+#### 3.1. SKU Management Implementation
+- Display current SKU in capacity dropdown (e.g., "MyCapacity - F8 (Running)")
+- Show/hide SKU container based on capacity selection
+- Populate SKU dropdown with available options (F2, F4, F8, F16, F32, F64, F128, F256, F512)
+- Enable "Update SKU" button only when different SKU is selected
+- Confirmation dialog for SKU changes on running capacities
+- PATCH API call to update capacity with new SKU
+- Automatic refresh after SKU change with re-selection of capacity
 
-#### 5. UI State Management
-- Loading indicators during operations
-- Button state management based on selection
-- Dropdown population with status indicators
-- Error handling and user feedback
+### HTML Structure Details
 
-## Advanced Features
+#### Required DOM Elements
+```html
+<!-- Existing elements -->
+<select id="capacitySelect" style="flex: 1;">
+    <option value="">Select a capacity...</option>
+</select>
+<button id="refreshButton">⟳</button>
 
-### Manual Refresh System
-- Refresh button for manual capacity list updates
-- Preserves user selection after refresh
-- Disabled during loading operations
-- Subtle UI feedback during refresh
+<!-- New SKU management section -->
+<div id="skuContainer" style="display: none;">
+    <div style="display: flex; gap: 10px; align-items: center; margin-top: 10px;">
+        <label for="skuSelect" style="font-size: 14px; color: #323130; font-weight: 600; min-width: 80px;">Current SKU:</label>
+        <select id="skuSelect" style="flex: 1;">
+            <option value="">Loading SKUs...</option>
+        </select>
+        <button id="updateSkuButton" style="flex: 0 0 auto; padding: 8px 12px; background-color: #0078d4; color: white;" disabled>
+            Update SKU
+        </button>
+    </div>
+</div>
 
-### Debug Capabilities
-- Comprehensive debug logging toggle
-- Detailed API call logging
-- Token validation information
-- State change tracking
+<!-- Existing action buttons -->
+<button id="startButton" class="start-button" disabled>Start Capacity</button>
+<button id="stopButton" class="stop-button" disabled>Stop Capacity</button>
+```
 
-### Cache Management
-- Double-click title to clear authentication cache
-- Intelligent token expiry detection
-- Automatic cache cleanup
+#### Additional CSS Styles
+```css
+.update-sku-button {
+    background-color: #0078d4;
+    color: white;
+}
 
-### Error Recovery
-- Automatic token refresh on API failures
-- Graceful handling of network issues
-- User-friendly error messaging
-- Fallback operations for edge cases
+.update-sku-button:hover:not(:disabled) {
+    background-color: #106ebe;
+}
 
-## Complete Feature Set
+.update-sku-button:disabled {
+    background-color: #8a8886;
+    color: #a19f9d;
+}
 
-### Production Features
-- ✅ OAuth2 authentication with Azure AD
-- ✅ Tenant name display and context
-- ✅ Cross-subscription capacity discovery
-- ✅ Real-time capacity status indicators
-- ✅ One-click start/stop operations
-- ✅ Manual refresh capability
-- ✅ Comprehensive logging system
-- ✅ Debug mode toggle
-- ✅ Intelligent token caching
-- ✅ Error handling and recovery
-- ✅ Microsoft design compliance
-- ✅ Responsive layout
-- ✅ State persistence
+.sku-container {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 12px;
+    background-color: #faf9f8;
+    border: 1px solid #e1dfdd;
+    border-radius: 2px;
+    margin: 8px 0;
+}
 
-### Security Features
-- ✅ Secure OAuth2 implementation
-- ✅ Token validation and refresh
-- ✅ CSRF protection with state parameter
-- ✅ No credentials stored locally
-- ✅ Proper error boundary handling
+.current-sku {
+    font-size: 14px;
+    color: #0078d4;
+    font-weight: 600;
+    background-color: #f3f9fd;
+    padding: 4px 8px;
+    border-radius: 2px;
+    border: 1px solid #deecf9;
+}
+```
 
-### User Experience Features
-- ✅ Loading indicators
-- ✅ Visual status feedback
-- ✅ Persistent user preferences
-- ✅ Intuitive button states
-- ✅ Clear error messaging
-- ✅ Professional Microsoft styling
+### JavaScript Implementation Details
 
-## Implementation Notes
+#### Required Class Properties (add to constructor)
+```javascript
+this.skuContainer = null;
+this.skuSelect = null;
+this.updateSkuButton = null;
+this.availableSkus = [];
+```
 
-1. **No Test/Mock Code**: Production-ready with real Azure API integration only
-2. **Token Security**: JWT tokens properly decoded and validated
-3. **Error Boundaries**: Comprehensive error handling at all levels
-4. **Performance**: Efficient API calls with caching and validation
-5. **Accessibility**: Proper labeling and keyboard navigation support
-6. **Responsive Design**: Flexible layout accommodating various content lengths
+#### Required Event Listeners
+```javascript
+this.updateSkuButton.addEventListener('click', () => {
+    this.updateCapacitySku();
+});
 
-## Deployment Checklist
+this.skuSelect.addEventListener('change', () => {
+    this.onSkuSelectionChange();
+});
+```
 
-- [ ] All files present and correctly named
-- [ ] Icon files generated (PNG and SVG)
-- [ ] No development/test code remaining
-- [ ] All API endpoints using production URLs
-- [ ] Error handling tested for all scenarios
-- [ ] Authentication flow tested end-to-end
-- [ ] UI tested with various data states
-- [ ] Debug logging verified in both modes
-- [ ] Token caching and expiry tested
-- [ ] Cross-subscription functionality verified
+#### Required Methods
+1. `loadAvailableSkus(capacity)` - Load available SKU options
+2. `populateSkuDropdown(capacity)` - Populate SKU dropdown with current and available options
+3. `onSkuSelectionChange()` - Handle SKU selection changes and enable/disable update button
+4. `updateCapacitySku()` - Perform PATCH API call to update capacity SKU
 
-This extension provides a complete, production-ready solution for managing Microsoft Fabric capacities with enterprise-grade authentication, comprehensive error handling, and a polished user experience following Microsoft design standards.
+#### SKU Options
+Standard Fabric SKUs: F2, F4, F8, F16, F32, F64, F128, F256, F512
+Display format: "F8 (8 vCores, 16 GB RAM)" with descriptions
