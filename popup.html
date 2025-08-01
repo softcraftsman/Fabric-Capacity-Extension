@@ -6,7 +6,7 @@
     <title>Fabric Capacity Extension</title>
     <style>
         body {
-            width: 400px;
+            width: 500px;
             padding: 16px;
             margin: 0;
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
@@ -14,7 +14,7 @@
         }
 
         h2 {
-            margin: 0 0 16px 0;
+            margin: 0;
             color: #323130;
             font-size: 18px;
             font-weight: 600;
@@ -126,6 +126,22 @@
             color: #a19f9d;
         }
 
+        .logout-button {
+            background-color: #605e5c;
+            color: white;
+            font-size: 12px;
+            padding: 3px 6px;
+            margin-left: 12px;
+            border-radius: 2px;
+            border: none;
+            cursor: pointer;
+            font-weight: normal;
+        }
+
+        .logout-button:hover:not(:disabled) {
+            background-color: #484644;
+        }
+
         .sku-container {
             display: flex;
             flex-direction: column;
@@ -222,7 +238,9 @@
 <body>
     <div class="container">
         <div class="header-container">
-            <h2>Microsoft Fabric</h2>
+            <div class="header-row">
+                <h2>Microsoft Fabric</h2>
+            </div>
             <div class="header-row">
                 <div class="tenant-info" id="tenantInfo" style="display: none;"></div>
                 <div class="loading-header" id="loadingIndicator">Loading capacities...</div>
@@ -263,6 +281,7 @@
             <div class="debug-container">
                 <input type="checkbox" id="debugToggle">
                 <label for="debugToggle">Enable Debug Logging</label>
+                <button id="logoutButton" class="logout-button" title="Logout and clear authentication">Logout</button>
             </div>
         </div>
     </div>

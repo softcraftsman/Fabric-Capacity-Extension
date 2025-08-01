@@ -4,7 +4,7 @@ A Microsoft Edge browser extension that provides a GUI interface for managing Mi
 
 ## Features
 
-- 🔐 **Azure AD Authentication** - Secure OAuth2 flow using `chrome.identity.launchWebAuthFlow` with token caching
+- 🔐 **Azure AD Authentication** - Secure OAuth2 flow with Microsoft Graph integration for user information
 - 🌐 **Cross-Subscription Discovery** - Automatically finds Fabric capacities across all your subscriptions
 - ▶️ **Start/Stop Controls** - Easy one-click capacity management
 - � **SKU Management** - View current SKU and change capacity sizes (F2, F4, F8, F16, F32, F64, F128, F256, F512)
@@ -14,6 +14,7 @@ A Microsoft Edge browser extension that provides a GUI interface for managing Mi
 - 💾 **Smart Token Caching** - Intelligent token management with automatic refresh and extended session persistence
 - 🔄 **Proactive Token Refresh** - Background token renewal to minimize login interruptions
 - ⏰ **Extended Sessions** - Stay logged in for hours with automatic silent authentication
+- ⚠️ **Clear Error Messages** - Helpful error messages and guidance when permissions are needed
 
 ## Installation
 
@@ -48,8 +49,37 @@ A Microsoft Edge browser extension that provides a GUI interface for managing Mi
 
 1. Click the extension icon in your Edge toolbar
 2. The extension will prompt you to sign in to Azure AD
-3. Grant the requested permissions for Azure Management API access
+3. **Authentication Process**:
+   - Uses exact Entra API permissions for Azure Service Management and Microsoft Graph
+   - Displays user name and tenant information in the header
+   - Requires appropriate permissions for Azure Management and user profile access
+   - You'll see a warning if admin consent is required for full functionality
 4. Wait for the extension to discover your Fabric capacities
+
+## Authentication & Admin Consent
+
+## Authentication & Permissions
+
+### Required Entra API Permissions
+
+This extension requires the following API permissions in your Azure AD app registration:
+
+- **Azure Service Management (user_impersonation)**: For managing Azure resources and Fabric capacities
+- **Microsoft Graph (User.Read)**: For displaying user information in the interface
+- **offline_access**: For token refresh capabilities
+
+### Authentication Scopes
+
+The extension uses these specific OAuth2 scopes:
+- `https://management.core.windows.net/user_impersonation` 
+- `https://graph.microsoft.com/User.Read`
+- `offline_access`
+
+### User Experience
+
+- **User Information**: Your name and tenant are displayed in the header
+- **Clear Permissions**: No fallback authentication - either full access or clear error messages
+- **Tenant Context**: Always shows which tenant you're working in
 
 ### Managing Capacities
 
@@ -80,6 +110,17 @@ A Microsoft Edge browser extension that provides a GUI interface for managing Mi
    - **Note**: SKU changes may require stopping the capacity first
    - The extension will prompt for confirmation if changing a running capacity
    - Status will auto-refresh after 3 seconds to show the new SKU
+
+5. **Logout and Re-authenticate**:
+   - Click the "Logout" button at the bottom-right next to "Enable Debug Logging"
+   - This will clear all cached tokens and reset the extension state
+   - Use this if you experience authentication issues or want to switch accounts
+   - After logout, click "Refresh" or select a capacity to re-authenticate
+
+### Additional Features
+
+- **Double-click title**: Double-click "Microsoft Fabric" title to clear authentication cache (alternative to logout button)
+- **Manual refresh**: Use the refresh button (⟳) to update capacity status without full reload
 
 ### Debug Mode
 

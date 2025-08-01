@@ -23,9 +23,17 @@ class FabricCapacityManager {
         
         // API endpoints and configuration
         this.baseUrl = 'https://management.azure.com';
+        this.graphUrl = 'https://graph.microsoft.com';
         this.subscriptionApiVersion = '2022-12-01';
         this.fabricApiVersion = '2023-11-01';
-        this.scope = 'https://management.azure.com/user_impersonation';
+        
+        // Scopes matching Entra API permissions exactly
+        this.scopes = [
+            'https://management.core.windows.net/user_impersonation', // Azure Service Management
+            'https://graph.microsoft.com/User.Read',                  // Microsoft Graph
+            'offline_access'                                          // Refresh token capability
+        ];
+        this.scope = this.scopes.join(' ');
     }
 
     /**
@@ -69,6 +77,7 @@ class FabricCapacityManager {
         this.skuContainer = document.getElementById('skuContainer');
         this.skuSelect = document.getElementById('skuSelect');
         this.updateSkuButton = document.getElementById('updateSkuButton');
+        this.logoutButton = document.getElementById('logoutButton');
 
         // Verify all elements were found
         const elements = {
@@ -82,7 +91,8 @@ class FabricCapacityManager {
             tenantInfo: this.tenantInfo,
             skuContainer: this.skuContainer,
             skuSelect: this.skuSelect,
-            updateSkuButton: this.updateSkuButton
+            updateSkuButton: this.updateSkuButton,
+            logoutButton: this.logoutButton
         };
 
         for (const [name, element] of Object.entries(elements)) {
@@ -139,6 +149,10 @@ class FabricCapacityManager {
                 this.onSkuSelectionChange();
             });
 
+            this.logoutButton.addEventListener('click', async () => {
+                await this.handleLogout();
+            });
+
             // Add double-click on title to clear authentication (for testing/troubleshooting)
             document.querySelector('h2').addEventListener('dblclick', async () => {
                 if (confirm('Clear cached authentication? This will require re-login.')) {
@@ -170,7 +184,7 @@ class FabricCapacityManager {
             const cachedToken = await this.getCachedToken();
             if (cachedToken && await this.validateToken(cachedToken)) {
                 this.accessToken = cachedToken;
-                this.updateTenantDisplay(cachedToken);
+                this.updateTenantAndUserDisplay(cachedToken);
                 this.log('Using cached authentication token');
                 this.debugLog('Cached token is valid');
                 
@@ -195,7 +209,7 @@ class FabricCapacityManager {
             const tokenInfo = await this.performOAuth2Flow();
             
             this.accessToken = tokenInfo.accessToken;
-            this.updateTenantDisplay(tokenInfo.accessToken);
+            this.updateTenantAndUserDisplay(tokenInfo.accessToken);
             await this.cacheToken(tokenInfo.accessToken, tokenInfo.expiresIn);
             this.log('Authentication successful');
             this.debugLog('New access token obtained and cached');
@@ -210,15 +224,33 @@ class FabricCapacityManager {
     }
 
     /**
-     * Perform OAuth2 authentication flow
+     * Perform OAuth2 authentication flow with fallback for no admin consent
      */
     async performOAuth2Flow() {
+        return new Promise(async (resolve, reject) => {
+            // Try primary scope first (legacy ARM scope)
+            try {
+                const tokenInfo = await this.attemptOAuth2WithScope(this.scopes[0]);
+                resolve(tokenInfo);
+                return;
+            } catch (primaryError) {
+                this.debugLog(`Authentication failed: ${primaryError.message}`);
+                this.logError('Authentication failed. Please ensure you have the required permissions.');
+                reject(primaryError);
+            }
+        });
+    }
+
+    /**
+     * Attempt OAuth2 authentication with specific scope
+     */
+    async attemptOAuth2WithScope(scopeString) {
         return new Promise((resolve, reject) => {
             // Azure AD OAuth2 endpoints
             const tenantId = 'common'; // Use 'common' for multi-tenant apps
             const clientId = 'b2f9922d-47b3-45de-be16-72911e143fa4';
             const redirectUri = chrome.identity.getRedirectURL();
-            const scope = encodeURIComponent(this.scope);
+            const scope = encodeURIComponent(scopeString);
             const responseType = 'token';
             const state = this.generateState();
 
@@ -232,7 +264,8 @@ class FabricCapacityManager {
                 `&response_mode=fragment` +
                 `&prompt=select_account`;
 
-            this.debugLog(`Starting OAuth2 flow with URL: ${authUrl}`);
+            this.debugLog(`Attempting OAuth2 flow with scope: ${scopeString}`);
+            this.debugLog(`Auth URL: ${authUrl}`);
             this.debugLog(`Redirect URI: ${redirectUri}`);
 
             chrome.identity.launchWebAuthFlow({
@@ -459,6 +492,41 @@ class FabricCapacityManager {
     }
 
     /**
+     * Handle logout button click - clear authentication and reset UI
+     */
+    async handleLogout() {
+        try {
+            this.log('Logging out...');
+            
+            // Clear authentication data
+            await this.clearCachedAuth();
+            this.accessToken = null;
+            
+            // Clear capacities and reset UI
+            this.capacities = [];
+            this.initialLoadComplete = false;
+            
+            // Reset UI elements
+            this.populateCapacityDropdown();
+            this.skuContainer.style.display = 'none';
+            this.startButton.disabled = true;
+            this.stopButton.disabled = true;
+            this.updateSkuButton.disabled = true;
+            
+            // Remove any auth warning
+            const existingWarning = document.getElementById('auth-warning');
+            if (existingWarning) {
+                existingWarning.remove();
+            }
+            
+            this.log('Logged out successfully. Click refresh or select a capacity to re-authenticate.');
+            
+        } catch (error) {
+            this.logError('Failed to logout', error);
+        }
+    }
+
+    /**
      * Handle token expiry with automatic silent refresh attempt
      */
     async handleTokenExpiry() {
@@ -484,15 +552,39 @@ class FabricCapacityManager {
     }
 
     /**
-     * Attempt silent authentication (non-interactive)
+     * Attempt silent authentication (non-interactive) with fallback scopes
      */
     async performSilentAuth() {
+        // Try primary scope first (legacy ARM scope)
+        try {
+            const tokenInfo = await this.attemptSilentAuthWithScope(this.scopes[0]);
+            return tokenInfo;
+        } catch (primaryError) {
+            this.debugLog(`Primary silent auth failed: ${primaryError.message}`);
+            
+            // If primary scope fails, try with basic scopes only
+            try {
+                this.debugLog('Attempting fallback silent authentication with basic scopes...');
+                const fallbackScopes = ['openid', 'profile', 'offline_access'];
+                const tokenInfo = await this.attemptSilentAuthWithScope(fallbackScopes.join(' '));
+                return tokenInfo;
+            } catch (fallbackError) {
+                this.debugLog(`Fallback silent auth failed: ${fallbackError.message}`);
+                return null;
+            }
+        }
+    }
+
+    /**
+     * Attempt silent authentication with specific scope
+     */
+    async attemptSilentAuthWithScope(scopeString) {
         return new Promise((resolve, reject) => {
             // Azure AD OAuth2 endpoints for silent auth
             const tenantId = 'common';
             const clientId = 'b2f9922d-47b3-45de-be16-72911e143fa4';
             const redirectUri = chrome.identity.getRedirectURL();
-            const scope = encodeURIComponent(this.scope);
+            const scope = encodeURIComponent(scopeString);
             const responseType = 'token';
             const state = this.generateState();
 
@@ -506,7 +598,7 @@ class FabricCapacityManager {
                 `&response_mode=fragment` +
                 `&prompt=none`;
 
-            this.debugLog(`Attempting silent auth with URL: ${authUrl}`);
+            this.debugLog(`Attempting silent auth with scope: ${scopeString}`);
 
             chrome.identity.launchWebAuthFlow({
                 url: authUrl,
@@ -514,13 +606,13 @@ class FabricCapacityManager {
             }, (responseUrl) => {
                 if (chrome.runtime.lastError) {
                     this.debugLog('Silent auth failed: ' + chrome.runtime.lastError.message);
-                    resolve(null);
+                    reject(new Error(chrome.runtime.lastError.message));
                     return;
                 }
 
                 if (!responseUrl) {
                     this.debugLog('No response URL from silent auth');
-                    resolve(null);
+                    reject(new Error('No response URL from silent auth'));
                     return;
                 }
 
@@ -529,7 +621,7 @@ class FabricCapacityManager {
                     resolve(tokenInfo);
                 } catch (error) {
                     this.debugLog('Failed to extract token from silent auth response: ' + error.message);
-                    resolve(null);
+                    reject(error);
                 }
             });
         });
@@ -572,7 +664,7 @@ class FabricCapacityManager {
                             this.debugLog('Proactive token refresh successful');
                             
                             // Update tenant display with new token
-                            this.updateTenantDisplay(refreshedTokenInfo.accessToken);
+                            this.updateTenantAndUserDisplay(refreshedTokenInfo.accessToken);
                         } else {
                             this.debugLog('Proactive token refresh failed, user will need to re-authenticate');
                         }
@@ -596,6 +688,12 @@ class FabricCapacityManager {
             this.log('Loading Fabric capacities...');
             this.showLoading(true);
             this.capacities = [];
+
+            // Check if we need to authenticate first
+            if (!this.accessToken) {
+                this.log('No authentication token available. Please authenticate first.');
+                await this.authenticate();
+            }
 
             // Get all subscriptions
             const subscriptions = await this.getSubscriptions();
@@ -628,9 +726,16 @@ class FabricCapacityManager {
      * Refresh capacities list (manual refresh only)
      */
     async refreshCapacities() {
-        // Don't refresh if we're already loading or don't have authentication
-        if (!this.accessToken || this.loadingIndicator.style.display === 'block') {
-            this.debugLog('Refresh skipped - not ready or already loading');
+        // Check if we need to authenticate first (e.g., after logout)
+        if (!this.accessToken) {
+            this.debugLog('No authentication token available, triggering full load with authentication');
+            await this.loadCapacities();
+            return;
+        }
+
+        // Don't refresh if we're already loading
+        if (this.loadingIndicator.style.display === 'block') {
+            this.debugLog('Refresh skipped - already loading');
             return;
         }
 
@@ -1069,8 +1174,13 @@ class FabricCapacityManager {
                     
                     if (!retryResponse.ok) {
                         const retryErrorText = await retryResponse.text();
-                        this.debugLog(`Retry API call failed after silent refresh: ${retryResponse.status} ${retryResponse.statusText} - ${retryErrorText}`);
-                        throw new Error(`API call failed after silent refresh: ${retryResponse.status} ${retryResponse.statusText}`);
+                        this.debugLog(`Retry failed: ${retryResponse.status} ${retryResponse.statusText} - ${retryErrorText}`);
+                        
+                        if (retryResponse.status === 403) {
+                            throw new Error(`Insufficient permissions. Admin consent may be required for full functionality.`);
+                        }
+                        
+                        throw new Error(`API call failed after retry: ${retryResponse.status} ${retryResponse.statusText}`);
                     }
                     
                     // Handle successful retry response
@@ -1094,8 +1204,13 @@ class FabricCapacityManager {
                     
                     if (!retryResponse.ok) {
                         const retryErrorText = await retryResponse.text();
-                        this.debugLog(`Retry API call failed after interactive auth: ${retryResponse.status} ${retryResponse.statusText} - ${retryErrorText}`);
-                        throw new Error(`API call failed after interactive authentication: ${retryResponse.status} ${retryResponse.statusText}`);
+                        this.debugLog(`Final retry failed: ${retryResponse.status} ${retryResponse.statusText} - ${retryErrorText}`);
+                        
+                        if (retryResponse.status === 403) {
+                            throw new Error(`Insufficient permissions. Admin consent may be required for full functionality.`);
+                        }
+                        
+                        throw new Error(`API call failed after authentication retry: ${retryResponse.status} ${retryResponse.statusText}`);
                     }
                     
                     // Handle successful retry response
@@ -1109,6 +1224,19 @@ class FabricCapacityManager {
                     const retryResponseText = await retryResponse.text();
                     return retryResponseText ? JSON.parse(retryResponseText) : {};
                 }
+            }
+            
+            if (response.status === 403) {
+                // Check if this is a permission issue vs admin consent issue
+                let errorMessage = 'Insufficient permissions to perform this operation.';
+                
+                if (errorText.includes('admin consent') || errorText.includes('consent')) {
+                    errorMessage += ' Admin consent may be required. Please contact your Azure administrator.';
+                } else if (errorText.includes('RBAC') || errorText.includes('role')) {
+                    errorMessage += ' You may need additional Azure RBAC permissions.';
+                }
+                
+                throw new Error(errorMessage);
             }
             
             throw new Error(`API call failed: ${response.status} ${response.statusText}`);
@@ -1247,9 +1375,179 @@ class FabricCapacityManager {
     }
 
     /**
-     * Update tenant display with information from the access token
+     * Check token capabilities and provide user guidance
      */
-    updateTenantDisplay(token) {
+    async checkTokenCapabilities() {
+        if (!this.accessToken) {
+            return { hasManagementAccess: false, message: 'No authentication token available' };
+        }
+
+        try {
+            // Test basic subscription access (this usually works with basic scopes)
+            const testUrl = `${this.baseUrl}/subscriptions?api-version=${this.subscriptionApiVersion}&$top=1`;
+            const response = await fetch(testUrl, {
+                method: 'GET',
+                headers: {
+                    'Authorization': `Bearer ${this.accessToken}`,
+                    'Content-Type': 'application/json'
+                }
+            });
+
+            if (response.ok) {
+                this.debugLog('Token has management API access');
+                return { 
+                    hasManagementAccess: true, 
+                    message: 'Full Azure Management API access available' 
+                };
+            } else if (response.status === 403) {
+                this.debugLog('Token has limited permissions');
+                return { 
+                    hasManagementAccess: false, 
+                    message: 'Limited permissions - Admin consent may be required for full functionality' 
+                };
+            } else {
+                this.debugLog(`Token validation failed: ${response.status}`);
+                return { 
+                    hasManagementAccess: false, 
+                    message: `Authentication issue: ${response.status} ${response.statusText}` 
+                };
+            }
+        } catch (error) {
+            this.debugLog('Token capability check failed: ' + error.message);
+            return { 
+                hasManagementAccess: false, 
+                message: 'Unable to verify token capabilities' 
+            };
+        }
+    }
+
+    /**
+     * Get user information from Microsoft Graph
+     */
+    async getUserInfo() {
+        try {
+            if (!this.accessToken) {
+                this.debugLog('No access token available for Graph API call');
+                return null;
+            }
+
+            const response = await fetch(`${this.graphUrl}/v1.0/me`, {
+                method: 'GET',
+                headers: {
+                    'Authorization': `Bearer ${this.accessToken}`,
+                    'Content-Type': 'application/json'
+                }
+            });
+
+            if (!response.ok) {
+                this.debugLog(`Graph API call failed: ${response.status} ${response.statusText}`);
+                return null;
+            }
+
+            const userInfo = await response.json();
+            this.debugLog('User info retrieved from Graph:', JSON.stringify({
+                displayName: userInfo.displayName,
+                userPrincipalName: userInfo.userPrincipalName,
+                givenName: userInfo.givenName,
+                surname: userInfo.surname
+            }));
+
+            return userInfo;
+        } catch (error) {
+            this.debugLog(`Failed to get user info from Graph: ${error.message}`);
+            return null;
+        }
+    }
+
+    /**
+     * Update tenant and user display with Graph API data
+     */
+    async updateTenantAndUserDisplay(token) {
+        try {
+            // First update with token data (synchronous)
+            this.updateTenantDisplayFromToken(token);
+            
+            // Then enhance with Graph API data (asynchronous)
+            const userInfo = await this.getUserInfo();
+            if (userInfo) {
+                const tokenData = this.decodeJwtToken(token);
+                const tenantName = tokenData?.tenant_display_name || tokenData?.tenant_name;
+                const userPrincipalName = tokenData?.upn || tokenData?.unique_name;
+                
+                // Create display with user name and tenant
+                let displayText = '';
+                if (userInfo.displayName) {
+                    displayText = `${userInfo.displayName}`;
+                    if (tenantName) {
+                        displayText += ` (${tenantName})`;
+                    } else if (userPrincipalName) {
+                        const domain = userPrincipalName.split('@')[1];
+                        if (domain) {
+                            displayText += ` (${domain})`;
+                        }
+                    }
+                } else if (tenantName) {
+                    displayText = `Tenant: ${tenantName}`;
+                } else if (userPrincipalName) {
+                    const domain = userPrincipalName.split('@')[1];
+                    displayText = domain ? `Tenant: ${domain}` : userPrincipalName;
+                }
+
+                if (displayText) {
+                    this.tenantInfo.textContent = displayText;
+                    this.tenantInfo.style.display = 'block';
+                    this.debugLog(`User and tenant display updated: ${displayText}`);
+                }
+            }
+
+            // Check token capabilities and update UI accordingly
+            this.checkTokenCapabilities().then(result => {
+                if (!result.hasManagementAccess) {
+                    this.log(`⚠️  ${result.message}`);
+                    
+                    // Add a subtle warning to the UI
+                    const existingWarning = document.getElementById('auth-warning');
+                    if (!existingWarning) {
+                        const warning = document.createElement('div');
+                        warning.id = 'auth-warning';
+                        warning.style.cssText = `
+                            background: #fff4ce;
+                            border: 1px solid #fed100;
+                            border-radius: 4px;
+                            padding: 8px;
+                            margin-bottom: 12px;
+                            font-size: 12px;
+                            color: #323130;
+                        `;
+                        warning.innerHTML = `
+                            <strong>Limited Access:</strong> Some features may require admin consent.<br>
+                            <small>Contact your administrator if you experience permission errors.</small>
+                        `;
+                        
+                        const container = document.querySelector('.container');
+                        if (container) {
+                            container.insertBefore(warning, container.firstChild);
+                        }
+                    }
+                } else {
+                    // Remove warning if it exists and we have full access
+                    const existingWarning = document.getElementById('auth-warning');
+                    if (existingWarning) {
+                        existingWarning.remove();
+                    }
+                }
+            });
+        } catch (error) {
+            this.debugLog('Failed to update tenant and user display: ' + error.message);
+            // Fallback to token-only display
+            this.updateTenantDisplayFromToken(token);
+        }
+    }
+
+    /**
+     * Update tenant display from token data only (fallback method)
+     */
+    updateTenantDisplayFromToken(token) {
         try {
             const tokenData = this.decodeJwtToken(token);
             if (!tokenData) {
@@ -1289,7 +1587,7 @@ class FabricCapacityManager {
                 this.debugLog('No tenant information available in token');
             }
         } catch (error) {
-            this.debugLog('Failed to update tenant display: ' + error.message);
+            this.debugLog('Failed to update tenant display from token: ' + error.message);
         }
     }
 }
