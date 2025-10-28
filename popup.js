@@ -9,7 +9,8 @@ class FabricCapacityManager {
         this.capacities = [];
         this.debugMode = false;
         this.logArea = null;
-        this.capacitySelect = null;
+        this.capacityList = null;
+        this.selectedCapacityIndex = null;
         this.startButton = null;
         this.stopButton = null;
         this.loadingIndicator = null;
@@ -20,6 +21,7 @@ class FabricCapacityManager {
         this.skuSelect = null;
         this.updateSkuButton = null;
         this.availableSkus = [];
+        this.tokenRefreshTimerId = null;
         
         // API endpoints and configuration
         this.baseUrl = 'https://management.azure.com';
@@ -50,12 +52,11 @@ class FabricCapacityManager {
 
             this.setupEventListeners();
             this.log('Extension initialized');
+            this.log('Click the refresh button to load capacities');
             
-            await this.authenticate();
-            await this.loadCapacities();
+            // Don't auto-authenticate or load capacities on init
+            // User must click refresh button to trigger authentication and loading
             
-            // Start proactive token refresh mechanism
-            this.startTokenRefreshTimer();
         } catch (error) {
             this.logError('Failed to initialize extension', error);
             console.error('Extension initialization failed:', error);
@@ -67,7 +68,7 @@ class FabricCapacityManager {
      */
     initializeElements() {
         this.logArea = document.getElementById('logArea');
-        this.capacitySelect = document.getElementById('capacitySelect');
+        this.capacityList = document.getElementById('capacityList');
         this.startButton = document.getElementById('startButton');
         this.stopButton = document.getElementById('stopButton');
         this.loadingIndicator = document.getElementById('loadingIndicator');
@@ -82,7 +83,7 @@ class FabricCapacityManager {
         // Verify all elements were found
         const elements = {
             logArea: this.logArea,
-            capacitySelect: this.capacitySelect,
+            capacityList: this.capacityList,
             startButton: this.startButton,
             stopButton: this.stopButton,
             loadingIndicator: this.loadingIndicator,
@@ -118,10 +119,6 @@ class FabricCapacityManager {
     setupEventListeners() {
         // Add error handling for event listeners
         try {
-            this.capacitySelect.addEventListener('change', async () => {
-                await this.onCapacitySelectionChange();
-            });
-
             this.refreshButton.addEventListener('click', async () => {
                 this.log('Manual refresh requested');
                 await this.refreshCapacities();
@@ -161,7 +158,7 @@ class FabricCapacityManager {
                     this.log('Authentication cache cleared');
                     this.capacities = [];
                     this.initialLoadComplete = false;
-                    this.populateCapacityDropdown();
+                    this.populateCapacityList();
                 }
             });
 
@@ -481,10 +478,9 @@ class FabricCapacityManager {
         return new Promise((resolve) => {
             chrome.storage.local.remove(['accessToken', 'tokenExpiry', 'sessionInfo'], () => {
                 this.debugLog('Cached authentication data cleared');
-                // Clear tenant display
+                // Reset tenant display to default
                 if (this.tenantInfo) {
-                    this.tenantInfo.style.display = 'none';
-                    this.tenantInfo.textContent = '';
+                    this.tenantInfo.textContent = 'Not logged in';
                 }
                 resolve();
             });
@@ -505,10 +501,12 @@ class FabricCapacityManager {
             // Clear capacities and reset UI
             this.capacities = [];
             this.initialLoadComplete = false;
+            this.selectedCapacityIndex = null;
             
             // Reset UI elements
-            this.populateCapacityDropdown();
-            this.skuContainer.style.display = 'none';
+            this.populateCapacityList();
+            this.skuSelect.disabled = true;
+            this.skuSelect.innerHTML = '<option value="">Select a capacity first...</option>';
             this.startButton.disabled = true;
             this.stopButton.disabled = true;
             this.updateSkuButton.disabled = true;
@@ -711,7 +709,7 @@ class FabricCapacityManager {
                 }
             }
 
-            this.populateCapacityDropdown();
+            this.populateCapacityList();
             this.log(`Loaded ${this.capacities.length} Fabric capacities`);
             this.initialLoadComplete = true;
 
@@ -726,10 +724,16 @@ class FabricCapacityManager {
      * Refresh capacities list (manual refresh only)
      */
     async refreshCapacities() {
-        // Check if we need to authenticate first (e.g., after logout)
+        // Check if we need to authenticate first (e.g., after logout or initial load)
         if (!this.accessToken) {
-            this.debugLog('No authentication token available, triggering full load with authentication');
+            this.debugLog('No authentication token available, triggering authentication and load');
+            await this.authenticate();
             await this.loadCapacities();
+            
+            // Start proactive token refresh mechanism after first authentication
+            if (!this.tokenRefreshTimerId) {
+                this.startTokenRefreshTimer();
+            }
             return;
         }
 
@@ -743,13 +747,12 @@ class FabricCapacityManager {
             this.debugLog('Refreshing capacity status...');
             
             // Store the currently selected capacity to restore selection after refresh
-            const selectedIndex = this.capacitySelect.value;
-            const selectedCapacityId = selectedIndex ? this.capacities[parseInt(selectedIndex)]?.id : null;
+            const selectedIndex = this.selectedCapacityIndex;
+            const selectedCapacityId = selectedIndex !== null ? this.capacities[parseInt(selectedIndex)]?.id : null;
 
             // Show subtle loading without full loading message
-            this.capacitySelect.disabled = true;
             this.refreshButton.disabled = true;
-            this.skuContainer.style.display = 'none';
+            this.skuSelect.disabled = true;
             
             // Get fresh capacity data
             const refreshedCapacities = [];
@@ -776,14 +779,14 @@ class FabricCapacityManager {
             }
 
             this.capacities = refreshedCapacities;
-            this.populateCapacityDropdown();
+            this.populateCapacityList();
 
             // Restore selection if the capacity still exists
             if (selectedCapacityId) {
                 const newIndex = this.capacities.findIndex(c => c.id === selectedCapacityId);
                 if (newIndex !== -1) {
-                    this.capacitySelect.value = newIndex.toString();
-                    await this.onCapacitySelectionChange();
+                    this.selectedCapacityIndex = newIndex;
+                    await this.onCapacityItemClick(newIndex);
                 }
             }
 
@@ -792,7 +795,6 @@ class FabricCapacityManager {
         } catch (error) {
             this.logError('Failed to refresh capacities', error);
         } finally {
-            this.capacitySelect.disabled = false;
             this.refreshButton.disabled = false;
         }
     }
@@ -835,71 +837,110 @@ class FabricCapacityManager {
     /**
      * Populate the capacity dropdown
      */
-    populateCapacityDropdown() {
+    populateCapacityList() {
         try {
-            this.debugLog(`Populating dropdown with ${this.capacities.length} capacities`);
+            this.debugLog(`Populating list with ${this.capacities.length} capacities`);
             
-            if (!this.capacitySelect) {
-                this.logError('Cannot populate dropdown - capacitySelect element not found');
+            if (!this.capacityList) {
+                this.logError('Cannot populate list - capacityList element not found');
                 return;
             }
 
-            // Clear existing options except the first one
-            while (this.capacitySelect.children.length > 1) {
-                this.capacitySelect.removeChild(this.capacitySelect.lastChild);
-            }
+            // Clear existing items
+            this.capacityList.innerHTML = '';
 
             if (this.capacities.length === 0) {
-                const option = document.createElement('option');
-                option.value = '';
-                option.textContent = 'No capacities found';
-                option.disabled = true;
-                this.capacitySelect.appendChild(option);
-                this.debugLog('Added "No capacities found" option');
+                const emptyItem = document.createElement('div');
+                emptyItem.className = 'capacity-list-item empty';
+                emptyItem.textContent = 'No capacities found';
+                this.capacityList.appendChild(emptyItem);
+                this.debugLog('Added "No capacities found" message');
                 return;
             }
 
-            // Add capacity options
+            // Add capacity items
             this.capacities.forEach((capacity, index) => {
-                const option = document.createElement('option');
-                option.value = index.toString();
+                const item = document.createElement('div');
+                item.className = 'capacity-list-item';
+                item.dataset.index = index.toString();
                 
                 const state = capacity.properties?.state || 'Unknown';
-                const stateDisplay = state === 'Active' ? '(Running)' : 
-                                   state === 'Paused' ? '(Stopped)' : 
-                                   `(${state})`;
-                
                 const sku = capacity.sku?.name || 'Unknown SKU';
-                option.textContent = `${capacity.name} - ${sku} ${stateDisplay}`;
                 
-                // Add visual styling based on state
+                // Create name element
+                const nameElement = document.createElement('div');
+                nameElement.className = 'capacity-name';
+                nameElement.textContent = capacity.name;
+                
+                // Create SKU element
+                const skuElement = document.createElement('div');
+                skuElement.className = 'capacity-sku';
+                skuElement.textContent = sku;
+                
+                // Create status element
+                const statusElement = document.createElement('div');
+                statusElement.className = 'capacity-status';
+                
                 if (state === 'Active') {
-                    option.className = 'status-running';
+                    statusElement.classList.add('running');
+                    statusElement.textContent = 'Running';
                 } else if (state === 'Paused') {
-                    option.className = 'status-stopped';
+                    statusElement.classList.add('stopped');
+                    statusElement.textContent = 'Stopped';
+                } else {
+                    statusElement.textContent = state;
                 }
                 
-                this.capacitySelect.appendChild(option);
-                this.debugLog(`Added capacity option: ${option.textContent}`);
+                // Append elements to item
+                item.appendChild(nameElement);
+                item.appendChild(skuElement);
+                item.appendChild(statusElement);
+                
+                // Add click event listener
+                item.addEventListener('click', async () => {
+                    await this.onCapacityItemClick(index);
+                });
+                
+                this.capacityList.appendChild(item);
+                this.debugLog(`Added capacity item: ${capacity.name} - ${sku} (${state})`);
             });
 
-            this.debugLog(`Dropdown population complete. Total options: ${this.capacitySelect.children.length}`);
+            this.debugLog(`List population complete. Total items: ${this.capacities.length}`);
         } catch (error) {
-            this.logError('Failed to populate dropdown', error);
-            console.error('Dropdown population failed:', error);
+            this.logError('Failed to populate list', error);
+            console.error('List population failed:', error);
         }
+    }
+
+    /**
+     * Handle capacity item click
+     */
+    async onCapacityItemClick(index) {
+        // Update selected state in UI
+        const allItems = this.capacityList.querySelectorAll('.capacity-list-item');
+        allItems.forEach(item => item.classList.remove('selected'));
+        
+        const clickedItem = this.capacityList.querySelector(`[data-index="${index}"]`);
+        if (clickedItem) {
+            clickedItem.classList.add('selected');
+        }
+        
+        this.selectedCapacityIndex = index;
+        await this.onCapacitySelectionChange();
     }
 
     /**
      * Handle capacity selection change
      */
     async onCapacitySelectionChange() {
-        const selectedIndex = this.capacitySelect.value;
+        const selectedIndex = this.selectedCapacityIndex;
         
-        if (!selectedIndex || selectedIndex === '') {
+        if (selectedIndex === null || selectedIndex === undefined) {
             this.startButton.disabled = true;
             this.stopButton.disabled = true;
-            this.skuContainer.style.display = 'none';
+            this.skuSelect.disabled = true;
+            this.updateSkuButton.disabled = true;
+            this.skuSelect.innerHTML = '<option value="">Select a capacity first...</option>';
             return;
         }
 
@@ -910,8 +951,8 @@ class FabricCapacityManager {
         this.startButton.disabled = (state === 'Active');
         this.stopButton.disabled = (state === 'Paused');
 
-        // Show SKU container and load available SKUs
-        this.skuContainer.style.display = 'block';
+        // Enable SKU controls and load available SKUs
+        this.skuSelect.disabled = false;
         await this.loadAvailableSkus(capacity);
         await this.populateSkuDropdown(capacity);
 
@@ -937,8 +978,8 @@ class FabricCapacityManager {
      * Perform capacity operation (start/stop)
      */
     async performCapacityOperation(operation, operationName) {
-        const selectedIndex = this.capacitySelect.value;
-        if (!selectedIndex || selectedIndex === '') return;
+        const selectedIndex = this.selectedCapacityIndex;
+        if (selectedIndex === null || selectedIndex === undefined) return;
 
         const capacity = this.capacities[parseInt(selectedIndex)];
         
@@ -1052,9 +1093,9 @@ class FabricCapacityManager {
      */
     onSkuSelectionChange() {
         const selectedSku = this.skuSelect.value;
-        const selectedIndex = this.capacitySelect.value;
+        const selectedIndex = this.selectedCapacityIndex;
         
-        if (!selectedIndex || selectedIndex === '') return;
+        if (selectedIndex === null || selectedIndex === undefined) return;
         
         const capacity = this.capacities[parseInt(selectedIndex)];
         const currentSku = capacity.sku?.name || 'Unknown';
@@ -1071,10 +1112,10 @@ class FabricCapacityManager {
      * Update the capacity SKU
      */
     async updateCapacitySku() {
-        const selectedIndex = this.capacitySelect.value;
+        const selectedIndex = this.selectedCapacityIndex;
         const selectedSku = this.skuSelect.value;
         
-        if (!selectedIndex || selectedIndex === '' || !selectedSku) return;
+        if (selectedIndex === null || selectedIndex === undefined || !selectedSku) return;
         
         const capacity = this.capacities[parseInt(selectedIndex)];
         const currentSku = capacity.sku?.name || 'Unknown';
@@ -1119,7 +1160,7 @@ class FabricCapacityManager {
             setTimeout(async () => {
                 await this.refreshCapacities();
                 // Re-select the same capacity to update the SKU dropdown
-                if (this.capacitySelect.value) {
+                if (this.selectedCapacityIndex !== null) {
                     await this.onCapacitySelectionChange();
                 }
             }, 3000);
@@ -1495,7 +1536,6 @@ class FabricCapacityManager {
 
                 if (displayText) {
                     this.tenantInfo.textContent = displayText;
-                    this.tenantInfo.style.display = 'block';
                     this.debugLog(`User and tenant display updated: ${displayText}`);
                 }
             }
@@ -1568,20 +1608,17 @@ class FabricCapacityManager {
 
             if (tenantName) {
                 this.tenantInfo.textContent = `Tenant: ${tenantName}`;
-                this.tenantInfo.style.display = 'block';
                 this.debugLog(`Tenant display updated: ${tenantName}`);
             } else if (userPrincipalName) {
                 // Fallback to domain from UPN if tenant name not available
                 const domain = userPrincipalName.split('@')[1];
                 if (domain) {
                     this.tenantInfo.textContent = `Tenant: ${domain}`;
-                    this.tenantInfo.style.display = 'block';
                     this.debugLog(`Tenant display updated with domain: ${domain}`);
                 }
             } else if (tenantId) {
                 // Last fallback to tenant ID
                 this.tenantInfo.textContent = `Tenant ID: ${tenantId}`;
-                this.tenantInfo.style.display = 'block';
                 this.debugLog(`Tenant display updated with ID: ${tenantId}`);
             } else {
                 this.debugLog('No tenant information available in token');

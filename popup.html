@@ -23,7 +23,7 @@
         .header-container {
             display: flex;
             flex-direction: column;
-            margin-bottom: 16px;
+            margin-bottom: 4px;
         }
 
         .header-row {
@@ -49,13 +49,13 @@
         .container {
             display: flex;
             flex-direction: column;
-            gap: 10px;
+            gap: 8px;
         }
 
         .controls-container {
             display: flex;
             flex-direction: column;
-            gap: 10px;
+            gap: 8px;
         }
 
         .button-container {
@@ -76,6 +76,103 @@
         select:disabled {
             opacity: 0.7;
             cursor: wait;
+        }
+
+        .capacity-list {
+            min-height: 140px;
+            max-height: 220px;
+            overflow-y: auto;
+            border: 1px solid #8a8886;
+            border-radius: 2px;
+            background-color: white;
+        }
+
+        .capacity-list-item {
+            padding: 8px 12px;
+            border-bottom: 1px solid #edebe9;
+            cursor: pointer;
+            transition: background-color 0.15s ease;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .capacity-list-item:last-child {
+            border-bottom: none;
+        }
+
+        .capacity-list-item:hover:not(.empty) {
+            background-color: #f3f2f1;
+        }
+
+        .capacity-list-item.selected {
+            background-color: #deecf9;
+            border-left: 3px solid #0078d4;
+            padding-left: 9px;
+        }
+
+        .capacity-list-item.empty {
+            color: #605e5c;
+            font-style: italic;
+            cursor: default;
+        }
+
+        .capacity-list-item.empty:hover {
+            background-color: white;
+        }
+
+        .capacity-name {
+            font-weight: 600;
+            color: #323130;
+            flex: 1;
+            font-size: 13px;
+        }
+
+        .capacity-sku {
+            font-size: 12px;
+            color: #605e5c;
+            margin-right: 12px;
+        }
+
+        .capacity-status {
+            font-size: 12px;
+            font-weight: 600;
+            padding: 3px 6px;
+            border-radius: 2px;
+        }
+
+        .capacity-status.running {
+            background-color: #f3f9f3;
+            color: #107C10;
+        }
+
+        .capacity-status.stopped {
+            background-color: #fef6f6;
+            color: #D83B01;
+        }
+
+        .refresh-button-header {
+            padding: 4px 8px;
+            background-color: #605e5c;
+            color: white;
+            border: none;
+            border-radius: 2px;
+            cursor: pointer;
+            font-size: 18px;
+            transition: background-color 0.2s ease;
+            line-height: 1;
+            min-width: auto;
+            max-width: 34px;
+            width: 34px;
+        }
+
+        .refresh-button-header:hover:not(:disabled) {
+            background-color: #484644;
+        }
+
+        .refresh-button-header:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
         }
 
         button {
@@ -240,28 +337,26 @@
         <div class="header-container">
             <div class="header-row">
                 <h2>Microsoft Fabric</h2>
+                <button id="refreshButton" class="refresh-button-header" title="Refresh capacity list">
+                    ⟳
+                </button>
             </div>
             <div class="header-row">
-                <div class="tenant-info" id="tenantInfo" style="display: none;"></div>
+                <div class="tenant-info" id="tenantInfo">Not logged in</div>
                 <div class="loading-header" id="loadingIndicator">Loading capacities...</div>
             </div>
         </div>
         
         <div class="controls-container">
-            <div style="display: flex; gap: 10px; align-items: center;">
-                <select id="capacitySelect" style="flex: 1;">
-                    <option value="">Select a capacity...</option>
-                </select>
-                <button id="refreshButton" style="flex: 0 0 auto; padding: 8px 12px; background-color: #605e5c; color: white;" title="Refresh capacity list">
-                    ⟳
-                </button>
+            <div id="capacityList" class="capacity-list">
+                <div class="capacity-list-item empty">Select a capacity...</div>
             </div>
             
-            <div id="skuContainer" style="display: none;">
-                <div style="display: flex; gap: 10px; align-items: center; margin-top: 10px;">
+            <div id="skuContainer">
+                <div style="display: flex; gap: 10px; align-items: center;">
                     <label for="skuSelect" style="font-size: 14px; color: #323130; font-weight: 600; min-width: 80px;">Current SKU:</label>
-                    <select id="skuSelect" style="flex: 1;">
-                        <option value="">Loading SKUs...</option>
+                    <select id="skuSelect" style="flex: 1;" disabled>
+                        <option value="">Select a capacity first...</option>
                     </select>
                     <button id="updateSkuButton" style="flex: 0 0 auto; padding: 8px 12px; background-color: #0078d4; color: white;" disabled>
                         Update SKU
@@ -276,7 +371,7 @@
         </div>
         
         <div class="log-container">
-            <textarea id="logArea" rows="20" cols="80" readonly placeholder="Operation logs will appear here..."></textarea>
+            <textarea id="logArea" rows="12" cols="80" readonly placeholder="Operation logs will appear here..."></textarea>
             
             <div class="debug-container">
                 <input type="checkbox" id="debugToggle">
