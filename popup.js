@@ -6,8 +6,11 @@
 class FabricCapacityManager {
     constructor() {
         this.accessToken = null;
-        this.capacities = [];
-        this.debugMode = false;
+        // Separate resource access tokens map (management, graph, etc.)
+        this.resourceTokens = {};
+    this.capacities = [];
+    this.debugMode = false;
+    this.autoRefreshOnOpen = false; // persisted user preference
         this.logArea = null;
         this.capacityList = null;
         this.selectedCapacityIndex = null;
@@ -29,13 +32,10 @@ class FabricCapacityManager {
         this.subscriptionApiVersion = '2022-12-01';
         this.fabricApiVersion = '2023-11-01';
         
-        // Scopes matching Entra API permissions exactly
-        this.scopes = [
-            'https://management.core.windows.net/user_impersonation', // Azure Service Management
-            'https://graph.microsoft.com/User.Read',                  // Microsoft Graph
-            'offline_access'                                          // Refresh token capability
-        ];
-        this.scope = this.scopes.join(' ');
+        // Resource-specific scope strings. Azure AD v2 does NOT allow combining scopes from different resources
+        // in a single authorize request. We start with management, later request Graph token using refresh token.
+        this.managementScopes = 'https://management.core.windows.net/user_impersonation offline_access openid profile';
+        this.graphScopes = 'https://graph.microsoft.com/User.Read openid profile'; // offline_access not required again
     }
 
     /**
@@ -53,6 +53,10 @@ class FabricCapacityManager {
             this.setupEventListeners();
             this.log('Extension initialized');
             this.log('Click the refresh button to load capacities');
+            if (this.autoRefreshOnOpen) {
+                this.log('Auto-refresh on open enabled; refreshing capacities...');
+                setTimeout(() => this.refreshCapacities(), 300);
+            }
             
             // Don't auto-authenticate or load capacities on init
             // User must click refresh button to trigger authentication and loading
@@ -71,8 +75,9 @@ class FabricCapacityManager {
         this.capacityList = document.getElementById('capacityList');
         this.startButton = document.getElementById('startButton');
         this.stopButton = document.getElementById('stopButton');
-        this.loadingIndicator = document.getElementById('loadingIndicator');
-        this.debugToggle = document.getElementById('debugToggle');
+    this.loadingIndicator = document.getElementById('loadingIndicator');
+    this.debugToggle = document.getElementById('debugToggle');
+    this.autoRefreshToggle = document.getElementById('autoRefreshToggle');
         this.refreshButton = document.getElementById('refreshButton');
         this.tenantInfo = document.getElementById('tenantInfo');
         this.skuContainer = document.getElementById('skuContainer');
@@ -88,6 +93,7 @@ class FabricCapacityManager {
             stopButton: this.stopButton,
             loadingIndicator: this.loadingIndicator,
             debugToggle: this.debugToggle,
+            autoRefreshToggle: this.autoRefreshToggle,
             refreshButton: this.refreshButton,
             tenantInfo: this.tenantInfo,
             skuContainer: this.skuContainer,
@@ -104,10 +110,19 @@ class FabricCapacityManager {
             }
         }
 
-        // Load debug mode preference
-        chrome.storage.local.get(['debugMode'], (result) => {
+        // Load persisted preferences
+        chrome.storage.local.get(['debugMode', 'autoRefreshOnOpen'], (result) => {
             this.debugMode = result.debugMode || false;
             this.debugToggle.checked = this.debugMode;
+            this.autoRefreshOnOpen = !!result.autoRefreshOnOpen;
+            if (this.autoRefreshToggle) {
+                this.autoRefreshToggle.checked = this.autoRefreshOnOpen;
+            }
+            // If preference loaded late and init already ran, trigger auto-refresh now
+            if (this.autoRefreshOnOpen) {
+                this.debugLog('Auto-refresh preference loaded; triggering initial refresh');
+                setTimeout(() => this.refreshCapacities(), 300);
+            }
         });
 
         return true;
@@ -137,6 +152,14 @@ class FabricCapacityManager {
                 chrome.storage.local.set({ debugMode: this.debugMode });
                 this.log(`Debug logging ${this.debugMode ? 'enabled' : 'disabled'}`);
             });
+
+            if (this.autoRefreshToggle) {
+                this.autoRefreshToggle.addEventListener('change', (e) => {
+                    this.autoRefreshOnOpen = e.target.checked;
+                    chrome.storage.local.set({ autoRefreshOnOpen: this.autoRefreshOnOpen });
+                    this.log(`Auto-refresh on open ${this.autoRefreshOnOpen ? 'enabled' : 'disabled'}`);
+                });
+            }
 
             this.updateSkuButton.addEventListener('click', () => {
                 this.updateCapacitySku();
@@ -173,51 +196,292 @@ class FabricCapacityManager {
      * Authenticate with Azure AD
      */
     async authenticate() {
+        // New authentication flow using Authorization Code + PKCE to obtain refresh token
         try {
-            this.log('Authenticating with Azure AD...');
+            this.log('Authenticating (PKCE code flow - management resource)...');
             this.showLoading(true);
 
-            // Check if we have a cached token first
-            const cachedToken = await this.getCachedToken();
-            if (cachedToken && await this.validateToken(cachedToken)) {
-                this.accessToken = cachedToken;
-                this.updateTenantAndUserDisplay(cachedToken);
-                this.log('Using cached authentication token');
-                this.debugLog('Cached token is valid');
-                
-                // Try to extend token lifetime silently in background
-                setTimeout(async () => {
-                    try {
-                        const refreshedTokenInfo = await this.performSilentAuth();
-                        if (refreshedTokenInfo && refreshedTokenInfo.accessToken !== cachedToken) {
-                            this.accessToken = refreshedTokenInfo.accessToken;
-                            await this.cacheToken(refreshedTokenInfo.accessToken, refreshedTokenInfo.expiresIn);
-                            this.debugLog('Background token refresh successful');
-                        }
-                    } catch (error) {
-                        this.debugLog('Background token refresh failed: ' + error.message);
+            // 1. Try to load existing token bundle (access + refresh)
+            const bundle = await this.getStoredTokenBundle();
+            if (bundle) {
+                const mgmt = bundle.resourceTokens?.management;
+                if (mgmt && Date.now() < mgmt.expiresAt - (2 * 60 * 1000)) {
+                    this.accessToken = mgmt.accessToken;
+                    this.resourceTokens.management = mgmt;
+                    this.updateTenantAndUserDisplay(mgmt.accessToken);
+                    this.log('Using cached management access token');
+                    return this.accessToken;
+                }
+                if (bundle.refreshToken) {
+                    const refreshedBundle = await this.refreshAccessToken(bundle.refreshToken, this.managementScopes);
+                    if (refreshedBundle) {
+                        const mgmtToken = refreshedBundle.resourceTokens.management;
+                        this.accessToken = mgmtToken.accessToken;
+                        this.updateTenantAndUserDisplay(mgmtToken.accessToken);
+                        this.log('Management access token refreshed silently');
+                        return this.accessToken;
                     }
-                }, 1000); // Delay to avoid blocking initial load
-                
-                return cachedToken;
+                }
             }
 
-            // Perform OAuth2 flow using launchWebAuthFlow
-            const tokenInfo = await this.performOAuth2Flow();
-            
-            this.accessToken = tokenInfo.accessToken;
-            this.updateTenantAndUserDisplay(tokenInfo.accessToken);
-            await this.cacheToken(tokenInfo.accessToken, tokenInfo.expiresIn);
-            this.log('Authentication successful');
-            this.debugLog('New access token obtained and cached');
-            
-            return tokenInfo.accessToken;
+            // 2. No valid bundle -> perform interactive PKCE auth code flow
+            const pkce = await this.generatePkcePair();
+            const authCode = await this.performPkceAuthFlow(pkce.codeChallenge, this.managementScopes);
+            const tokens = await this.exchangeAuthCodeForTokens(authCode, pkce.codeVerifier, this.managementScopes);
+            if (!tokens?.access_token) throw new Error('Token response missing access_token');
+
+            const mgmtToken = {
+                accessToken: tokens.access_token,
+                expiresAt: Date.now() + ((tokens.expires_in || 3600) * 1000)
+            };
+            const bundleToStore = {
+                refreshToken: tokens.refresh_token,
+                resourceTokens: { management: mgmtToken }
+            };
+            await this.storeTokenBundle(bundleToStore);
+            this.accessToken = mgmtToken.accessToken;
+            this.resourceTokens.management = mgmtToken;
+            this.updateTenantAndUserDisplay(mgmtToken.accessToken);
+            this.log('Authentication successful (management scope)');
+            if (!tokens.refresh_token) {
+                this.log('⚠️ No refresh_token returned. Verify offline_access scope and public client settings.');
+            }
+            return this.accessToken;
         } catch (error) {
             this.logError('Authentication error', error);
             throw error;
         } finally {
             this.showLoading(false);
         }
+    }
+
+    /**
+     * Generate PKCE code_verifier & code_challenge pair
+     */
+    async generatePkcePair() {
+        const array = new Uint8Array(32);
+        crypto.getRandomValues(array);
+        const codeVerifier = Array.from(array).map(b => ('0' + b.toString(16)).slice(-2)).join('');
+        const encoder = new TextEncoder();
+        const digest = await crypto.subtle.digest('SHA-256', encoder.encode(codeVerifier));
+        const hashArray = Array.from(new Uint8Array(digest));
+        const base64 = btoa(String.fromCharCode.apply(null, hashArray))
+            .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+        return { codeVerifier, codeChallenge: base64 };
+    }
+
+    /**
+     * Perform interactive PKCE auth code flow to obtain authorization code
+     */
+    async performPkceAuthFlow(codeChallenge, scopeString) {
+        return new Promise((resolve, reject) => {
+            const tenantId = 'common'; // Multi-tenant; replace with specific tenant if desired
+            const clientId = 'b2f9922d-47b3-45de-be16-72911e143fa4';
+            const redirectUri = chrome.identity.getRedirectURL();
+            const scope = encodeURIComponent(scopeString);
+            const state = this.generateState();
+
+            const authUrl = `https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/authorize` +
+                `?client_id=${clientId}` +
+                `&response_type=code` +
+                `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+                `&scope=${scope}` +
+                `&state=${state}` +
+                `&code_challenge=${codeChallenge}` +
+                `&code_challenge_method=S256` +
+                `&prompt=select_account`;
+
+            this.debugLog('Launching PKCE authorization flow');
+
+            chrome.identity.launchWebAuthFlow({ url: authUrl, interactive: true }, (responseUrl) => {
+                if (chrome.runtime.lastError) {
+                    reject(new Error(chrome.runtime.lastError.message));
+                    return;
+                }
+                if (!responseUrl) {
+                    reject(new Error('Empty response URL from PKCE auth flow'));
+                    return;
+                }
+                try {
+                    const url = new URL(responseUrl);
+                    const params = new URLSearchParams(url.search.substring(1));
+                    const returnedState = params.get('state');
+                    if (returnedState !== state) {
+                        throw new Error('State mismatch (CSRF protection failed)');
+                    }
+                    const error = params.get('error');
+                    if (error) {
+                        const desc = params.get('error_description');
+                        throw new Error(`Auth error: ${error} ${desc || ''}`);
+                    }
+                    const code = params.get('code');
+                    if (!code) {
+                        throw new Error('Authorization code missing in response');
+                    }
+                    resolve(code);
+                } catch (e) {
+                    reject(e);
+                }
+            });
+        });
+    }
+
+    /**
+     * Exchange authorization code for tokens (access + refresh)
+     */
+    async exchangeAuthCodeForTokens(code, codeVerifier, scopeString) {
+        const tenantId = 'common';
+        const clientId = 'b2f9922d-47b3-45de-be16-72911e143fa4';
+        const redirectUri = chrome.identity.getRedirectURL();
+        const body = new URLSearchParams({
+            client_id: clientId,
+            grant_type: 'authorization_code',
+            code: code,
+            code_verifier: codeVerifier,
+            redirect_uri: redirectUri,
+            scope: scopeString
+        });
+        const tokenUrl = `https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`;
+        const resp = await fetch(tokenUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: body.toString()
+        });
+        const json = await resp.json();
+        if (!resp.ok) {
+            this.debugLog('Code exchange failed: ' + JSON.stringify(json));
+            throw new Error(json.error_description || json.error || 'Code exchange failed');
+        }
+        this.debugLog('Received token response (access + maybe refresh)');
+        return json;
+    }
+
+    /**
+     * Refresh access token using stored refresh token
+     */
+    async refreshAccessToken(refreshToken, scopeString) {
+        try {
+            const tenantId = 'common';
+            const clientId = 'b2f9922d-47b3-45de-be16-72911e143fa4';
+            const body = new URLSearchParams({
+                client_id: clientId,
+                grant_type: 'refresh_token',
+                refresh_token: refreshToken,
+                scope: scopeString
+            });
+            const tokenUrl = `https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`;
+            const resp = await fetch(tokenUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: body.toString()
+            });
+            const json = await resp.json();
+            if (!resp.ok) {
+                this.debugLog('Refresh failed: ' + JSON.stringify(json));
+                if (json.error === 'invalid_grant') {
+                    // Refresh token revoked / expired
+                    await this.clearTokenBundle();
+                    return null;
+                }
+                return null;
+            }
+            // Determine which resource this refresh was for
+            const isManagement = scopeString.includes('management.core.windows.net');
+            const isGraph = scopeString.includes('graph.microsoft.com');
+            const existing = await this.getStoredTokenBundle() || { resourceTokens: {} };
+            existing.refreshToken = json.refresh_token || existing.refreshToken || refreshToken;
+            const tokenObj = {
+                accessToken: json.access_token,
+                expiresAt: Date.now() + ((json.expires_in || 3600) * 1000)
+            };
+            if (isManagement) {
+                existing.resourceTokens.management = tokenObj;
+            } else if (isGraph) {
+                existing.resourceTokens.graph = tokenObj;
+            }
+            await this.storeTokenBundle(existing);
+            return existing;
+        } catch (e) {
+            this.debugLog('Refresh threw: ' + e.message);
+            return null;
+        }
+    }
+
+    /**
+     * Ensure Graph API access token available; uses refresh token to get new one if needed.
+     */
+    async ensureGraphAccessToken() {
+        const bundle = await this.getStoredTokenBundle();
+        if (!bundle?.refreshToken) return null;
+        const graphTok = bundle.resourceTokens?.graph;
+        if (graphTok && Date.now() < graphTok.expiresAt - (2 * 60 * 1000)) {
+            this.resourceTokens.graph = graphTok;
+            return graphTok.accessToken;
+        }
+        const refreshed = await this.refreshAccessToken(bundle.refreshToken, this.graphScopes);
+        return refreshed?.resourceTokens?.graph?.accessToken || null;
+    }
+
+    /**
+     * Store token bundle (access + refresh + expiry) in chrome.storage.local
+     */
+    async storeTokenBundle(bundle) {
+        return new Promise(resolve => {
+            // Add session info for integrity (hash of access token)
+            const anyAccess = bundle.resourceTokens?.management?.accessToken || bundle.resourceTokens?.graph?.accessToken || '';
+            const sessionInfo = {
+                cachedAt: Date.now(),
+                tokenHash: this.generateTokenHash(anyAccess)
+            };
+            chrome.storage.local.set({ tokenBundle: bundle, sessionInfo }, () => {
+                if (chrome.runtime.lastError) {
+                    this.debugLog('Failed storing tokenBundle: ' + chrome.runtime.lastError.message);
+                } else {
+                    this.debugLog('tokenBundle stored (resources: ' + Object.keys(bundle.resourceTokens || {}).join(', ') + ')');
+                }
+                resolve();
+            });
+        });
+    }
+
+    /**
+     * Retrieve stored token bundle
+     */
+    async getStoredTokenBundle() {
+        return new Promise(resolve => {
+            chrome.storage.local.get(['tokenBundle', 'sessionInfo'], result => {
+                if (chrome.runtime.lastError) {
+                    this.debugLog('Failed retrieving tokenBundle: ' + chrome.runtime.lastError.message);
+                    resolve(null);
+                    return;
+                }
+                const bundle = result.tokenBundle;
+                if (!bundle?.resourceTokens) {
+                    resolve(null);
+                    return;
+                }
+                // Optional integrity check
+                const anyAccess = bundle.resourceTokens.management?.accessToken || bundle.resourceTokens.graph?.accessToken || '';
+                if (result.sessionInfo?.tokenHash !== this.generateTokenHash(anyAccess)) {
+                    this.debugLog('tokenBundle integrity check failed');
+                    resolve(null);
+                    return;
+                }
+                resolve(bundle);
+            });
+        });
+    }
+
+    /**
+     * Clear stored token bundle (full logout scenario)
+     */
+    async clearTokenBundle() {
+        return new Promise(resolve => {
+            chrome.storage.local.remove(['tokenBundle', 'sessionInfo'], () => {
+                this.debugLog('tokenBundle cleared');
+                resolve();
+            });
+        });
     }
 
     /**
@@ -652,7 +916,7 @@ class FabricCapacityManager {
                     const minutesUntilExpiry = Math.floor(timeUntilExpiry / (60 * 1000));
                     
                     // If token expires in less than 15 minutes, try to refresh
-                    if (minutesUntilExpiry < 15 && minutesUntilExpiry > 0) {
+                    if (minutesUntilExpiry < 30 && minutesUntilExpiry > 0) {
                         this.debugLog(`Token expires in ${minutesUntilExpiry} minutes, attempting proactive refresh`);
                         
                         const refreshedTokenInfo = await this.performSilentAuth();
@@ -1467,15 +1731,17 @@ class FabricCapacityManager {
      */
     async getUserInfo() {
         try {
-            if (!this.accessToken) {
-                this.debugLog('No access token available for Graph API call');
+            // Ensure we have a Graph access token (separate from management token)
+            const graphAccessToken = await this.ensureGraphAccessToken();
+            if (!graphAccessToken) {
+                this.debugLog('No Graph access token available');
                 return null;
             }
 
             const response = await fetch(`${this.graphUrl}/v1.0/me`, {
                 method: 'GET',
                 headers: {
-                    'Authorization': `Bearer ${this.accessToken}`,
+                    'Authorization': `Bearer ${graphAccessToken}`,
                     'Content-Type': 'application/json'
                 }
             });
@@ -1539,7 +1805,7 @@ class FabricCapacityManager {
                     this.debugLog(`User and tenant display updated: ${displayText}`);
                 }
             }
-
+            // Note: management access token remains primary for Azure calls; Graph token fetched separately.
             // Check token capabilities and update UI accordingly
             this.checkTokenCapabilities().then(result => {
                 if (!result.hasManagementAccess) {
