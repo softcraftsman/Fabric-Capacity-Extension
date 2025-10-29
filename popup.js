@@ -36,6 +36,8 @@ class FabricCapacityManager {
         // in a single authorize request. We start with management, later request Graph token using refresh token.
         this.managementScopes = 'https://management.core.windows.net/user_impersonation offline_access openid profile';
         this.graphScopes = 'https://graph.microsoft.com/User.Read openid profile'; // offline_access not required again
+        // Proactive refresh safety window (ms before expiry)
+        this.refreshSafetyWindowMs = 3 * 60 * 1000; // 3 minutes
     }
 
     /**
@@ -196,12 +198,9 @@ class FabricCapacityManager {
      * Authenticate with Azure AD
      */
     async authenticate() {
-        // New authentication flow using Authorization Code + PKCE to obtain refresh token
         try {
-            this.log('Authenticating (PKCE code flow - management resource)...');
+            this.log('Authenticating (PKCE management scope)...');
             this.showLoading(true);
-
-            // 1. Try to load existing token bundle (access + refresh)
             const bundle = await this.getStoredTokenBundle();
             if (bundle) {
                 const mgmt = bundle.resourceTokens?.management;
@@ -214,9 +213,10 @@ class FabricCapacityManager {
                 }
                 if (bundle.refreshToken) {
                     const refreshedBundle = await this.refreshAccessToken(bundle.refreshToken, this.managementScopes);
-                    if (refreshedBundle) {
+                    if (refreshedBundle?.resourceTokens?.management) {
                         const mgmtToken = refreshedBundle.resourceTokens.management;
                         this.accessToken = mgmtToken.accessToken;
+                        this.resourceTokens.management = mgmtToken;
                         this.updateTenantAndUserDisplay(mgmtToken.accessToken);
                         this.log('Management access token refreshed silently');
                         return this.accessToken;
@@ -224,27 +224,25 @@ class FabricCapacityManager {
                 }
             }
 
-            // 2. No valid bundle -> perform interactive PKCE auth code flow
+            // Interactive PKCE flow
             const pkce = await this.generatePkcePair();
             const authCode = await this.performPkceAuthFlow(pkce.codeChallenge, this.managementScopes);
             const tokens = await this.exchangeAuthCodeForTokens(authCode, pkce.codeVerifier, this.managementScopes);
             if (!tokens?.access_token) throw new Error('Token response missing access_token');
-
             const mgmtToken = {
                 accessToken: tokens.access_token,
                 expiresAt: Date.now() + ((tokens.expires_in || 3600) * 1000)
             };
-            const bundleToStore = {
+            await this.storeTokenBundle({
                 refreshToken: tokens.refresh_token,
                 resourceTokens: { management: mgmtToken }
-            };
-            await this.storeTokenBundle(bundleToStore);
+            });
             this.accessToken = mgmtToken.accessToken;
             this.resourceTokens.management = mgmtToken;
             this.updateTenantAndUserDisplay(mgmtToken.accessToken);
             this.log('Authentication successful (management scope)');
             if (!tokens.refresh_token) {
-                this.log('⚠️ No refresh_token returned. Verify offline_access scope and public client settings.');
+                this.log('⚠️ No refresh_token returned. Check offline_access scope and public client settings.');
             }
             return this.accessToken;
         } catch (error) {
@@ -342,7 +340,7 @@ class FabricCapacityManager {
             scope: scopeString
         });
         const tokenUrl = `https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`;
-        const resp = await fetch(tokenUrl, {
+        const resp = await this.timedFetch(tokenUrl, {
             method: 'POST',
             headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
             body: body.toString()
@@ -361,6 +359,10 @@ class FabricCapacityManager {
      */
     async refreshAccessToken(refreshToken, scopeString) {
         try {
+            // Debounce concurrent refresh attempts
+            if (this._refreshingPromise) {
+                return await this._refreshingPromise;
+            }
             const tenantId = 'common';
             const clientId = 'b2f9922d-47b3-45de-be16-72911e143fa4';
             const body = new URLSearchParams({
@@ -370,19 +372,22 @@ class FabricCapacityManager {
                 scope: scopeString
             });
             const tokenUrl = `https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`;
-            const resp = await fetch(tokenUrl, {
+            this._refreshingPromise = this.timedFetch(tokenUrl, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
                 body: body.toString()
             });
+            const resp = await this._refreshingPromise;
             const json = await resp.json();
             if (!resp.ok) {
                 this.debugLog('Refresh failed: ' + JSON.stringify(json));
                 if (json.error === 'invalid_grant') {
                     // Refresh token revoked / expired
                     await this.clearTokenBundle();
+                    this._refreshingPromise = null;
                     return null;
                 }
+                this._refreshingPromise = null;
                 return null;
             }
             // Determine which resource this refresh was for
@@ -392,7 +397,8 @@ class FabricCapacityManager {
             existing.refreshToken = json.refresh_token || existing.refreshToken || refreshToken;
             const tokenObj = {
                 accessToken: json.access_token,
-                expiresAt: Date.now() + ((json.expires_in || 3600) * 1000)
+                expiresAt: Date.now() + ((json.expires_in || 3600) * 1000),
+                payload: this.decodeJwtToken(json.access_token)
             };
             if (isManagement) {
                 existing.resourceTokens.management = tokenObj;
@@ -400,9 +406,11 @@ class FabricCapacityManager {
                 existing.resourceTokens.graph = tokenObj;
             }
             await this.storeTokenBundle(existing);
+            this._refreshingPromise = null;
             return existing;
         } catch (e) {
             this.debugLog('Refresh threw: ' + e.message);
+            this._refreshingPromise = null;
             return null;
         }
     }
@@ -426,21 +434,29 @@ class FabricCapacityManager {
      * Store token bundle (access + refresh + expiry) in chrome.storage.local
      */
     async storeTokenBundle(bundle) {
-        return new Promise(resolve => {
-            // Add session info for integrity (hash of access token)
-            const anyAccess = bundle.resourceTokens?.management?.accessToken || bundle.resourceTokens?.graph?.accessToken || '';
-            const sessionInfo = {
-                cachedAt: Date.now(),
-                tokenHash: this.generateTokenHash(anyAccess)
-            };
-            chrome.storage.local.set({ tokenBundle: bundle, sessionInfo }, () => {
-                if (chrome.runtime.lastError) {
-                    this.debugLog('Failed storing tokenBundle: ' + chrome.runtime.lastError.message);
-                } else {
-                    this.debugLog('tokenBundle stored (resources: ' + Object.keys(bundle.resourceTokens || {}).join(', ') + ')');
-                }
+        // Cache decoded JWT payloads for each resource token for reuse
+        for (const [key, tok] of Object.entries(bundle.resourceTokens || {})) {
+            if (tok?.accessToken && !tok.payload) {
+                tok.payload = this.decodeJwtToken(tok.accessToken);
+            }
+        }
+        return new Promise(async resolve => {
+            try {
+                const anyAccess = bundle.resourceTokens?.management?.accessToken || bundle.resourceTokens?.graph?.accessToken || '';
+                const sha256 = anyAccess ? await this.computeSHA256(anyAccess) : '';
+                const sessionInfo = { cachedAt: Date.now(), tokenHash: sha256 };
+                chrome.storage.local.set({ tokenBundle: bundle, sessionInfo }, () => {
+                    if (chrome.runtime.lastError) {
+                        this.debugLog('Failed storing tokenBundle: ' + chrome.runtime.lastError.message);
+                    } else {
+                        this.debugLog('tokenBundle stored (resources: ' + Object.keys(bundle.resourceTokens || {}).join(', ') + ', hash=SHA256)');
+                    }
+                    resolve();
+                });
+            } catch (e) {
+                this.debugLog('storeTokenBundle failed: ' + e.message);
                 resolve();
-            });
+            }
         });
     }
 
@@ -449,7 +465,7 @@ class FabricCapacityManager {
      */
     async getStoredTokenBundle() {
         return new Promise(resolve => {
-            chrome.storage.local.get(['tokenBundle', 'sessionInfo'], result => {
+            chrome.storage.local.get(['tokenBundle', 'sessionInfo'], async result => {
                 if (chrome.runtime.lastError) {
                     this.debugLog('Failed retrieving tokenBundle: ' + chrome.runtime.lastError.message);
                     resolve(null);
@@ -460,12 +476,25 @@ class FabricCapacityManager {
                     resolve(null);
                     return;
                 }
-                // Optional integrity check
                 const anyAccess = bundle.resourceTokens.management?.accessToken || bundle.resourceTokens.graph?.accessToken || '';
-                if (result.sessionInfo?.tokenHash !== this.generateTokenHash(anyAccess)) {
-                    this.debugLog('tokenBundle integrity check failed');
-                    resolve(null);
-                    return;
+                if (result.sessionInfo?.tokenHash) {
+                    try {
+                        const calc = anyAccess ? await this.computeSHA256(anyAccess) : '';
+                        if (calc !== result.sessionInfo.tokenHash) {
+                            this.debugLog('tokenBundle integrity check failed (SHA-256 mismatch)');
+                            resolve(null);
+                            return;
+                        }
+                    } catch (e) {
+                        this.debugLog('Integrity check error: ' + e.message);
+                        resolve(null);
+                        return;
+                    }
+                }
+                for (const tok of Object.values(bundle.resourceTokens)) {
+                    if (tok && tok.accessToken && !tok.payload) {
+                        tok.payload = this.decodeJwtToken(tok.accessToken);
+                    }
                 }
                 resolve(bundle);
             });
@@ -622,6 +651,36 @@ class FabricCapacityManager {
         }
         return Math.abs(hash).toString();
     }
+    /** Compute SHA-256 digest (hex) */
+    async computeSHA256(str) {
+        const data = new TextEncoder().encode(str);
+        const digest = await crypto.subtle.digest('SHA-256', data);
+        return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('');
+    }
+    /** Timed fetch wrapper with AbortController */
+    async timedFetch(url, options = {}, timeoutMs = 15000) {
+        const controller = new AbortController();
+        const id = setTimeout(() => controller.abort(), timeoutMs);
+        try {
+            return await fetch(url, { ...options, signal: controller.signal });
+        } finally {
+            clearTimeout(id);
+        }
+    }
+    /** Ensure management token refreshed inside safety window */
+    async ensureFreshManagementToken() {
+        const bundle = await this.getStoredTokenBundle();
+        const mgmt = bundle?.resourceTokens?.management;
+        if (!bundle || !mgmt) return null;
+        if (Date.now() > mgmt.expiresAt - this.refreshSafetyWindowMs) {
+            this.debugLog('Management token near expiry; proactive refresh');
+            if (bundle.refreshToken) {
+                const refreshed = await this.refreshAccessToken(bundle.refreshToken, this.managementScopes);
+                return refreshed?.resourceTokens?.management?.accessToken || mgmt.accessToken;
+            }
+        }
+        return mgmt.accessToken;
+    }
 
     /**
      * Get cached authentication token
@@ -758,9 +817,11 @@ class FabricCapacityManager {
         try {
             this.log('Logging out...');
             
-            // Clear authentication data
+            // Clear all authentication data (both new token bundle and legacy cache)
+            await this.clearTokenBundle();
             await this.clearCachedAuth();
             this.accessToken = null;
+            this.resourceTokens = {};
             
             // Clear capacities and reset UI
             this.capacities = [];
@@ -956,22 +1017,26 @@ class FabricCapacityManager {
                 this.log('No authentication token available. Please authenticate first.');
                 await this.authenticate();
             }
+            // Throttle very rapid consecutive loads (<3s)
+            const now = Date.now();
+            if (now - this._lastCapacityRefreshTs < 3000) {
+                this.debugLog('Skipping loadCapacities (recent refresh <3s)');
+                this.showLoading(false);
+                return;
+            }
 
-            // Get all subscriptions
             const subscriptions = await this.getSubscriptions();
             this.debugLog(`Found ${subscriptions.length} subscriptions`);
-
-            // Get capacities from all subscriptions
-            for (const subscription of subscriptions) {
+            const capacityArrays = await Promise.all(subscriptions.map(async sub => {
                 try {
-                    const capacities = await this.getCapacitiesForSubscription(subscription.subscriptionId);
-                    this.capacities.push(...capacities);
-                    this.debugLog(`Found ${capacities.length} capacities in subscription ${subscription.displayName}`);
-                } catch (error) {
-                    this.debugLog(`Failed to get capacities for subscription ${subscription.subscriptionId}: ${error.message}`);
-                    // Continue with other subscriptions
+                    return await this.getCapacitiesForSubscription(sub.subscriptionId);
+                } catch (e) {
+                    this.debugLog(`Failed capacities for ${sub.subscriptionId}: ${e.message}`);
+                    return [];
                 }
-            }
+            }));
+            this.capacities = capacityArrays.flat();
+            this._lastCapacityRefreshTs = Date.now();
 
             this.populateCapacityList();
             this.log(`Loaded ${this.capacities.length} Fabric capacities`);
@@ -1122,52 +1187,32 @@ class FabricCapacityManager {
                 return;
             }
 
-            // Add capacity items
+            // Batch DOM operations using a fragment
+            const frag = document.createDocumentFragment();
             this.capacities.forEach((capacity, index) => {
                 const item = document.createElement('div');
                 item.className = 'capacity-list-item';
                 item.dataset.index = index.toString();
-                
                 const state = capacity.properties?.state || 'Unknown';
                 const sku = capacity.sku?.name || 'Unknown SKU';
-                
-                // Create name element
                 const nameElement = document.createElement('div');
                 nameElement.className = 'capacity-name';
                 nameElement.textContent = capacity.name;
-                
-                // Create SKU element
                 const skuElement = document.createElement('div');
                 skuElement.className = 'capacity-sku';
                 skuElement.textContent = sku;
-                
-                // Create status element
                 const statusElement = document.createElement('div');
                 statusElement.className = 'capacity-status';
-                
-                if (state === 'Active') {
-                    statusElement.classList.add('running');
-                    statusElement.textContent = 'Running';
-                } else if (state === 'Paused') {
-                    statusElement.classList.add('stopped');
-                    statusElement.textContent = 'Stopped';
-                } else {
-                    statusElement.textContent = state;
-                }
-                
-                // Append elements to item
+                if (state === 'Active') { statusElement.classList.add('running'); statusElement.textContent = 'Running'; }
+                else if (state === 'Paused') { statusElement.classList.add('stopped'); statusElement.textContent = 'Stopped'; }
+                else { statusElement.textContent = state; }
                 item.appendChild(nameElement);
                 item.appendChild(skuElement);
                 item.appendChild(statusElement);
-                
-                // Add click event listener
-                item.addEventListener('click', async () => {
-                    await this.onCapacityItemClick(index);
-                });
-                
-                this.capacityList.appendChild(item);
-                this.debugLog(`Added capacity item: ${capacity.name} - ${sku} (${state})`);
+                item.addEventListener('click', async () => { await this.onCapacityItemClick(index); });
+                frag.appendChild(item);
             });
+            this.capacityList.appendChild(frag);
 
             this.debugLog(`List population complete. Total items: ${this.capacities.length}`);
         } catch (error) {
@@ -1447,7 +1492,12 @@ class FabricCapacityManager {
         }
 
         this.debugLog(`Making ${method} request to: ${url}`);
-
+        // Proactive pre-expiry refresh
+        const freshToken = await this.ensureFreshManagementToken();
+        if (freshToken && freshToken !== this.accessToken) {
+            this.accessToken = freshToken;
+            this.debugLog('Access token updated before API call (proactive refresh)');
+        }
         const options = {
             method: method,
             headers: {
@@ -1460,7 +1510,7 @@ class FabricCapacityManager {
             options.body = JSON.stringify(body);
         }
 
-        const response = await fetch(url, options);
+    const response = await this.timedFetch(url, options, 20000);
 
         if (!response.ok) {
             const errorText = await response.text();
@@ -1475,7 +1525,7 @@ class FabricCapacityManager {
                 if (refreshedToken) {
                     // Retry with refreshed token
                     options.headers['Authorization'] = `Bearer ${refreshedToken}`;
-                    const retryResponse = await fetch(url, options);
+                    const retryResponse = await this.timedFetch(url, options, 20000);
                     
                     if (!retryResponse.ok) {
                         const retryErrorText = await retryResponse.text();
@@ -1505,7 +1555,7 @@ class FabricCapacityManager {
                     
                     // Retry the original request with new token
                     options.headers['Authorization'] = `Bearer ${this.accessToken}`;
-                    const retryResponse = await fetch(url, options);
+                    const retryResponse = await this.timedFetch(url, options, 20000);
                     
                     if (!retryResponse.ok) {
                         const retryErrorText = await retryResponse.text();
@@ -1593,6 +1643,7 @@ class FabricCapacityManager {
             
             if (this.logArea) {
                 this.logArea.value += logMessage;
+                this._truncateLogsIfNeeded();
                 this.logArea.scrollTop = this.logArea.scrollHeight;
             } else {
                 console.log('Extension Log:', logMessage);
@@ -1610,6 +1661,7 @@ class FabricCapacityManager {
             const timestamp = new Date().toLocaleTimeString();
             const logMessage = `[${timestamp}] ${message}\n`;
             this.logArea.value += logMessage;
+            this._truncateLogsIfNeeded();
             this.logArea.scrollTop = this.logArea.scrollHeight;
         }
     }
@@ -1635,6 +1687,7 @@ class FabricCapacityManager {
             
             if (this.logArea) {
                 this.logArea.value += logMessage;
+                this._truncateLogsIfNeeded();
                 this.logArea.scrollTop = this.logArea.scrollHeight;
             } else {
                 console.error('Extension Error:', logMessage);
@@ -1651,7 +1704,26 @@ class FabricCapacityManager {
         const timestamp = new Date().toLocaleTimeString();
         const logMessage = `[${timestamp}] SUCCESS: ${message}\n`;
         this.logArea.value += logMessage;
+        this._truncateLogsIfNeeded();
         this.logArea.scrollTop = this.logArea.scrollHeight;
+    }
+
+    /** Truncate accumulated logs to reduce memory usage */
+    _truncateLogsIfNeeded() {
+        if (!this.logArea) return;
+        const MAX_CHARS = 50000;
+        if (this.logArea.value.length > MAX_CHARS) {
+            const keep = this.logArea.value.slice(Math.floor(MAX_CHARS * 0.4));
+            this.logArea.value = '[log truncated]\n' + keep;
+        }
+    }
+
+    /** Shared auth header builder */
+    getAuthHeaders(token) {
+        return {
+            'Authorization': `Bearer ${token}`,
+            'Content-Type': 'application/json'
+        };
     }
 
     /**
@@ -1738,7 +1810,7 @@ class FabricCapacityManager {
                 return null;
             }
 
-            const response = await fetch(`${this.graphUrl}/v1.0/me`, {
+            const response = await this.timedFetch(`${this.graphUrl}/v1.0/me`, {
                 method: 'GET',
                 headers: {
                     'Authorization': `Bearer ${graphAccessToken}`,

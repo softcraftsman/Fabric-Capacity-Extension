@@ -15,8 +15,12 @@
   },
   "host_permissions": [
     "https://management.azure.com/*",
-    "https://login.microsoftonline.com/*"
+    "https://login.microsoftonline.com/*",
+    "https://graph.microsoft.com/*"
   ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; connect-src https://management.azure.com https://login.microsoftonline.com https://graph.microsoft.com;"
+  },
   "action": {
     "default_popup": "popup.html",
     "default_title": "Fabric Capacity Extension",
