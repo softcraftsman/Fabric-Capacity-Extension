@@ -9,6 +9,8 @@ class FabricCapacityManager {
         // Separate resource access tokens map (management, graph, etc.)
         this.resourceTokens = {};
         this.capacities = [];
+        this.subscriptions = [];
+        this.selectedCapacityIndices = new Set();
         this.debugMode = false;
         this.autoRefreshOnOpen = false; // persisted user preference
         this.logArea = null;
@@ -24,6 +26,7 @@ class FabricCapacityManager {
         this.skuSelect = null;
         this.updateSkuButton = null;
         this.availableSkus = [];
+        this.capacityCosts = {}; // { resourceId.toLowerCase(): { cost, currency } }
         this.tokenRefreshTimerId = null;
         
         // API endpoints and configuration
@@ -37,9 +40,9 @@ class FabricCapacityManager {
         // this at runtime via the Settings panel in the extension popup.
         // The tenantId starts as 'common' and is updated to the logged-in
         // user's actual tenant ID after the first successful authentication.
-        this.defaultClientId = 'b2f9922d-47b3-45de-be16-72911e143fa4';
+        this.defaultClientId = 'b75cf7c4-8802-401f-8daa-226d5cb55f78';
         this.clientId = this.defaultClientId;
-        this.tenantId = 'common'; // Updated to user's actual tenant ID after first login
+        this.tenantId = '17ab6ae4-62da-43e0-9140-dddeb0a17bf0';
 
         // Settings UI elements
         this.settingsToggleButton = null;
@@ -105,6 +108,8 @@ class FabricCapacityManager {
         this.skuSelect = document.getElementById('skuSelect');
         this.updateSkuButton = document.getElementById('updateSkuButton');
         this.logoutButton = document.getElementById('logoutButton');
+        this.selectAllCheckbox = document.getElementById('selectAllCheckbox');
+        this.capacityListToolbar = document.getElementById('capacityListToolbar');
         this.settingsToggleButton = document.getElementById('settingsToggleButton');
         this.settingsPanel = document.getElementById('settingsPanel');
         this.clientIdInput = document.getElementById('clientIdInput');
@@ -125,6 +130,8 @@ class FabricCapacityManager {
             skuSelect: this.skuSelect,
             updateSkuButton: this.updateSkuButton,
             logoutButton: this.logoutButton,
+            selectAllCheckbox: this.selectAllCheckbox,
+            capacityListToolbar: this.capacityListToolbar,
             settingsToggleButton: this.settingsToggleButton,
             settingsPanel: this.settingsPanel,
             clientIdInput: this.clientIdInput,
@@ -215,6 +222,11 @@ class FabricCapacityManager {
 
             this.logoutButton.addEventListener('click', async () => {
                 await this.handleLogout();
+            });
+
+            // Select All checkbox in toolbar
+            this.selectAllCheckbox.addEventListener('change', (e) => {
+                this.onSelectAllChange(e.target.checked);
             });
 
             // Settings panel toggle
@@ -1128,6 +1140,7 @@ class FabricCapacityManager {
             }
 
             const subscriptions = await this.getSubscriptions();
+            this.subscriptions = subscriptions;
             this.debugLog(`Found ${subscriptions.length} subscriptions`);
             const capacityArrays = await Promise.all(subscriptions.map(async sub => {
                 try {
@@ -1144,10 +1157,102 @@ class FabricCapacityManager {
             this.log(`Loaded ${this.capacities.length} Fabric capacities`);
             this.initialLoadComplete = true;
 
+            // Fetch costs in background (non-blocking)
+            this.fetchCapacityCosts();
+
         } catch (error) {
             this.logError('Failed to load capacities', error);
         } finally {
             this.showLoading(false);
+        }
+    }
+
+    /**
+     * Fetch month-to-date costs for capacities via Azure Cost Management API
+     */
+    async fetchCapacityCosts() {
+        if (this.subscriptions.length === 0) return;
+
+        try {
+            this.debugLog('Fetching capacity costs...');
+
+            // Fetch costs for each subscription that has capacities
+            const subscriptionIds = [...new Set(this.capacities.map(c => c.subscriptionId))];
+
+            for (const subscriptionId of subscriptionIds) {
+                try {
+                    const url = `${this.baseUrl}/subscriptions/${subscriptionId}/providers/Microsoft.CostManagement/query?api-version=2023-11-01`;
+
+                    const body = {
+                        type: 'ActualCost',
+                        timeframe: 'MonthToDate',
+                        dataset: {
+                            granularity: 'None',
+                            aggregation: {
+                                totalCost: { name: 'Cost', function: 'Sum' }
+                            },
+                            grouping: [
+                                { type: 'Dimension', name: 'ResourceId' }
+                            ]
+                        }
+                    };
+
+                    const data = await this.makeApiCall(url, 'POST', body);
+
+                    if (data.properties?.rows) {
+                        for (const row of data.properties.rows) {
+                            const cost = row[0];
+                            const resourceId = row[1];
+                            const currency = row[2] || 'USD';
+                            if (resourceId && cost > 0) {
+                                this.capacityCosts[resourceId.toLowerCase()] = { cost, currency };
+                            }
+                        }
+                    }
+                } catch (err) {
+                    this.debugLog(`Cost fetch failed for subscription ${subscriptionId}: ${err.message}`);
+                }
+            }
+
+            this.debugLog(`Fetched costs for ${Object.keys(this.capacityCosts).length} resources.`);
+            this.updateCostBadges();
+        } catch (err) {
+            this.debugLog(`Cost fetch failed (non-critical): ${err.message}`);
+        }
+    }
+
+    updateCostBadges() {
+        // Update cost badges on all rendered capacity items
+        for (let i = 0; i < this.capacities.length; i++) {
+            const capacity = this.capacities[i];
+            const resourceId = capacity.id?.toLowerCase();
+            const costData = this.capacityCosts[resourceId];
+
+            const item = this.capacityList?.querySelector(`.capacity-list-item[data-index="${i}"]`);
+            if (!item) continue;
+
+            // Remove existing cost badge if any
+            const existing = item.querySelector('.cost-badge');
+            if (existing) existing.remove();
+
+            if (costData && costData.cost >= 0.01) {
+                const badge = document.createElement('span');
+                badge.className = 'cost-badge';
+                badge.title = 'Month-to-date cost';
+
+                const formatted = costData.cost < 100
+                    ? `$${costData.cost.toFixed(2)}`
+                    : `$${Math.round(costData.cost).toLocaleString()}`;
+                badge.textContent = formatted;
+
+                // Insert before the status element
+                const statusEl = item.querySelector('.capacity-status');
+                if (statusEl) {
+                    item.insertBefore(badge, statusEl);
+                } else {
+                    item.appendChild(badge);
+                }
+            }
         }
     }
 
@@ -1266,7 +1371,7 @@ class FabricCapacityManager {
     }
 
     /**
-     * Populate the capacity dropdown
+     * Populate the capacity list grouped by subscription
      */
     populateCapacityList() {
         try {
@@ -1279,47 +1384,270 @@ class FabricCapacityManager {
 
             // Clear existing items
             this.capacityList.innerHTML = '';
+            // Clear multi-selection state
+            this.selectedCapacityIndices = new Set();
 
             if (this.capacities.length === 0) {
                 const emptyItem = document.createElement('div');
                 emptyItem.className = 'capacity-list-item empty';
                 emptyItem.textContent = 'No capacities found';
                 this.capacityList.appendChild(emptyItem);
+                this.capacityListToolbar.style.display = 'none';
                 this.debugLog('Added "No capacities found" message');
                 return;
             }
 
+            // Show toolbar
+            this.capacityListToolbar.style.display = 'flex';
+            this.selectAllCheckbox.checked = false;
+            this.selectAllCheckbox.indeterminate = false;
+
+            // Group capacities by subscriptionId
+            const groups = {};
+            this.capacities.forEach((capacity, index) => {
+                const subId = capacity.subscriptionId || 'unknown';
+                if (!groups[subId]) {
+                    groups[subId] = [];
+                }
+                groups[subId].push({ capacity, index });
+            });
+
+            // Build a subscription name lookup
+            const subNameMap = {};
+            (this.subscriptions || []).forEach(sub => {
+                subNameMap[sub.subscriptionId] = sub.displayName || sub.subscriptionId;
+            });
+
             // Batch DOM operations using a fragment
             const frag = document.createDocumentFragment();
-            this.capacities.forEach((capacity, index) => {
-                const item = document.createElement('div');
-                item.className = 'capacity-list-item';
-                item.dataset.index = index.toString();
-                const state = capacity.properties?.state || 'Unknown';
-                const sku = capacity.sku?.name || 'Unknown SKU';
-                const nameElement = document.createElement('div');
-                nameElement.className = 'capacity-name';
-                nameElement.textContent = capacity.name;
-                const skuElement = document.createElement('div');
-                skuElement.className = 'capacity-sku';
-                skuElement.textContent = sku;
-                const statusElement = document.createElement('div');
-                statusElement.className = 'capacity-status';
-                if (state === 'Active') { statusElement.classList.add('running'); statusElement.textContent = 'Running'; }
-                else if (state === 'Paused') { statusElement.classList.add('stopped'); statusElement.textContent = 'Stopped'; }
-                else { statusElement.textContent = state; }
-                item.appendChild(nameElement);
-                item.appendChild(skuElement);
-                item.appendChild(statusElement);
-                item.addEventListener('click', async () => { await this.onCapacityItemClick(index); });
-                frag.appendChild(item);
-            });
-            this.capacityList.appendChild(frag);
 
+            Object.keys(groups).forEach(subId => {
+                const items = groups[subId];
+                const subName = subNameMap[subId] || subId;
+
+                // Category header
+                const header = document.createElement('div');
+                header.className = 'category-header';
+                header.dataset.subscriptionId = subId;
+
+                const categoryCheckbox = document.createElement('input');
+                categoryCheckbox.type = 'checkbox';
+                categoryCheckbox.className = 'category-checkbox';
+                categoryCheckbox.dataset.subscriptionId = subId;
+                categoryCheckbox.title = `Select all in ${subName}`;
+                categoryCheckbox.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                });
+                categoryCheckbox.addEventListener('change', (e) => {
+                    this.onCategoryCheckboxChange(subId, e.target.checked);
+                });
+                header.appendChild(categoryCheckbox);
+
+                const labelEl = document.createElement('span');
+                labelEl.className = 'category-label';
+                labelEl.textContent = subName;
+                labelEl.title = subName;
+                header.appendChild(labelEl);
+
+                const countEl = document.createElement('span');
+                countEl.className = 'category-count';
+                countEl.textContent = `(${items.length})`;
+                header.appendChild(countEl);
+
+                frag.appendChild(header);
+
+                // Individual capacity items
+                items.forEach(({ capacity, index }) => {
+                    const item = document.createElement('div');
+                    item.className = 'capacity-list-item';
+                    item.dataset.index = index.toString();
+                    item.dataset.subscriptionId = subId;
+
+                    const state = capacity.properties?.state || 'Unknown';
+                    const sku = capacity.sku?.name || 'Unknown SKU';
+
+                    const checkbox = document.createElement('input');
+                    checkbox.type = 'checkbox';
+                    checkbox.className = 'capacity-checkbox';
+                    checkbox.dataset.index = index.toString();
+                    checkbox.addEventListener('click', (e) => {
+                        e.stopPropagation();
+                    });
+                    checkbox.addEventListener('change', (e) => {
+                        this.onCapacityCheckboxChange(index, e.target.checked);
+                    });
+                    item.appendChild(checkbox);
+
+                    const nameElement = document.createElement('div');
+                    nameElement.className = 'capacity-name';
+                    nameElement.textContent = capacity.name;
+                    nameElement.style.flex = '1';
+
+                    const skuElement = document.createElement('div');
+                    skuElement.className = 'capacity-sku';
+                    skuElement.textContent = sku;
+
+                    const statusElement = document.createElement('div');
+                    statusElement.className = 'capacity-status';
+                    if (state === 'Active') { statusElement.classList.add('running'); statusElement.textContent = 'Running'; }
+                    else if (state === 'Paused') { statusElement.classList.add('stopped'); statusElement.textContent = 'Stopped'; }
+                    else { statusElement.textContent = state; }
+
+                    item.appendChild(nameElement);
+                    item.appendChild(skuElement);
+                    item.appendChild(statusElement);
+
+                    // Row click for single-select (SKU operations)
+                    item.addEventListener('click', async () => { await this.onCapacityItemClick(index); });
+                    frag.appendChild(item);
+                });
+            });
+
+            this.capacityList.appendChild(frag);
+            this.updateButtonStates();
             this.debugLog(`List population complete. Total items: ${this.capacities.length}`);
         } catch (error) {
             this.logError('Failed to populate list', error);
             console.error('List population failed:', error);
+        }
+    }
+
+    /**
+     * Handle Select All checkbox change
+     */
+    onSelectAllChange(checked) {
+        if (checked) {
+            this.capacities.forEach((_, index) => this.selectedCapacityIndices.add(index));
+        } else {
+            this.selectedCapacityIndices.clear();
+        }
+        // Update all individual checkboxes
+        this.capacityList.querySelectorAll('.capacity-checkbox').forEach(cb => {
+            cb.checked = checked;
+            const item = cb.closest('.capacity-list-item');
+            if (item) item.classList.toggle('checked-item', checked);
+        });
+        // Update all category checkboxes
+        this.capacityList.querySelectorAll('.category-checkbox').forEach(cb => {
+            cb.checked = checked;
+            cb.indeterminate = false;
+        });
+        this.updateButtonStates();
+        this.debugLog(`Select All: ${checked ? 'checked' : 'unchecked'} (${this.selectedCapacityIndices.size} selected)`);
+    }
+
+    /**
+     * Handle category (subscription group) checkbox change
+     */
+    onCategoryCheckboxChange(subscriptionId, checked) {
+        // Find all capacity indices in this subscription group
+        const items = this.capacityList.querySelectorAll(`.capacity-list-item[data-subscription-id="${subscriptionId}"]`);
+        items.forEach(item => {
+            const idx = parseInt(item.dataset.index);
+            const cb = item.querySelector('.capacity-checkbox');
+            if (cb) cb.checked = checked;
+            if (checked) {
+                this.selectedCapacityIndices.add(idx);
+                item.classList.add('checked-item');
+            } else {
+                this.selectedCapacityIndices.delete(idx);
+                item.classList.remove('checked-item');
+            }
+        });
+        this.updateSelectAllCheckbox();
+        this.updateButtonStates();
+        this.debugLog(`Category ${subscriptionId}: ${checked ? 'all selected' : 'all deselected'}`);
+    }
+
+    /**
+     * Handle individual capacity checkbox change
+     */
+    onCapacityCheckboxChange(index, checked) {
+        if (checked) {
+            this.selectedCapacityIndices.add(index);
+        } else {
+            this.selectedCapacityIndices.delete(index);
+        }
+        // Update visual state
+        const item = this.capacityList.querySelector(`.capacity-list-item[data-index="${index}"]`);
+        if (item) item.classList.toggle('checked-item', checked);
+
+        // Update category checkbox state for this item's subscription
+        const subId = this.capacities[index]?.subscriptionId;
+        if (subId) {
+            this.updateCategoryCheckbox(subId);
+        }
+        this.updateSelectAllCheckbox();
+        this.updateButtonStates();
+        this.debugLog(`Capacity [${index}] checkbox: ${checked} (total selected: ${this.selectedCapacityIndices.size})`);
+    }
+
+    /**
+     * Update a category checkbox based on the state of its children
+     */
+    updateCategoryCheckbox(subscriptionId) {
+        const categoryCheckbox = this.capacityList.querySelector(`.category-header[data-subscription-id="${subscriptionId}"] .category-checkbox`);
+        if (!categoryCheckbox) return;
+
+        const items = this.capacityList.querySelectorAll(`.capacity-list-item[data-subscription-id="${subscriptionId}"] .capacity-checkbox`);
+        let checkedCount = 0;
+        items.forEach(cb => { if (cb.checked) checkedCount++; });
+
+        if (checkedCount === 0) {
+            categoryCheckbox.checked = false;
+            categoryCheckbox.indeterminate = false;
+        } else if (checkedCount === items.length) {
+            categoryCheckbox.checked = true;
+            categoryCheckbox.indeterminate = false;
+        } else {
+            categoryCheckbox.checked = false;
+            categoryCheckbox.indeterminate = true;
+        }
+    }
+
+    /**
+     * Update the Select All master checkbox based on overall state
+     */
+    updateSelectAllCheckbox() {
+        const total = this.capacities.length;
+        const selected = this.selectedCapacityIndices.size;
+        if (selected === 0) {
+            this.selectAllCheckbox.checked = false;
+            this.selectAllCheckbox.indeterminate = false;
+        } else if (selected === total) {
+            this.selectAllCheckbox.checked = true;
+            this.selectAllCheckbox.indeterminate = false;
+        } else {
+            this.selectAllCheckbox.checked = false;
+            this.selectAllCheckbox.indeterminate = true;
+        }
+    }
+
+    /**
+     * Update Start/Stop button enabled state based on selections
+     */
+    updateButtonStates() {
+        if (this.selectedCapacityIndices.size > 0) {
+            // Multi-select mode: enable buttons based on selected capacities' states
+            let hasActive = false;
+            let hasPaused = false;
+            this.selectedCapacityIndices.forEach(idx => {
+                const cap = this.capacities[idx];
+                const state = cap?.properties?.state;
+                if (state === 'Active') hasActive = true;
+                if (state === 'Paused') hasPaused = true;
+            });
+            this.startButton.disabled = !hasPaused;
+            this.stopButton.disabled = !hasActive;
+        } else if (this.selectedCapacityIndex !== null && this.selectedCapacityIndex !== undefined) {
+            // Single-select fallback
+            const capacity = this.capacities[parseInt(this.selectedCapacityIndex)];
+            const state = capacity?.properties?.state || 'Unknown';
+            this.startButton.disabled = (state === 'Active');
+            this.stopButton.disabled = (state === 'Paused');
+        } else {
+            this.startButton.disabled = true;
+            this.stopButton.disabled = true;
         }
     }
 
@@ -1341,7 +1669,7 @@ class FabricCapacityManager {
     }
 
     /**
-     * Handle capacity selection change
+     * Handle capacity selection change (single-select for SKU operations)
      */
     async onCapacitySelectionChange() {
         const selectedIndex = this.selectedCapacityIndex;
@@ -1358,9 +1686,8 @@ class FabricCapacityManager {
         const capacity = this.capacities[parseInt(selectedIndex)];
         const state = capacity.properties?.state || 'Unknown';
 
-        // Enable/disable buttons based on current state
-        this.startButton.disabled = (state === 'Active');
-        this.stopButton.disabled = (state === 'Paused');
+        // Update button states (respects multi-select if active)
+        this.updateButtonStates();
 
         // Enable SKU controls and load available SKUs
         this.skuSelect.disabled = false;
@@ -1386,31 +1713,70 @@ class FabricCapacityManager {
     }
 
     /**
-     * Perform capacity operation (start/stop)
+     * Perform capacity operation (start/stop) — supports batch if multiple selected
      */
     async performCapacityOperation(operation, operationName) {
-        const selectedIndex = this.selectedCapacityIndex;
-        if (selectedIndex === null || selectedIndex === undefined) return;
+        // Determine which capacities to operate on
+        let targetIndices = [];
+        if (this.selectedCapacityIndices.size > 0) {
+            targetIndices = [...this.selectedCapacityIndices];
+        } else if (this.selectedCapacityIndex !== null && this.selectedCapacityIndex !== undefined) {
+            targetIndices = [parseInt(this.selectedCapacityIndex)];
+        }
 
-        const capacity = this.capacities[parseInt(selectedIndex)];
-        
+        if (targetIndices.length === 0) return;
+
+        // Filter to only relevant capacities (Start→Paused, Stop→Active)
+        const relevantState = (operation === 'resume') ? 'Paused' : 'Active';
+        const relevantIndices = targetIndices.filter(idx => {
+            const cap = this.capacities[idx];
+            return cap?.properties?.state === relevantState;
+        });
+
+        if (relevantIndices.length === 0) {
+            this.log(`No capacities in ${relevantState} state to ${operation}`);
+            return;
+        }
+
         try {
-            this.log(`${operationName} capacity ${capacity.name}...`);
             await this.setButtonsEnabled(false);
+            const total = relevantIndices.length;
+            this.log(`${operationName} ${total} capacity${total > 1 ? 'ies' : ''}...`);
 
-            const url = `${this.baseUrl}${capacity.id}/${operation}?api-version=${this.fabricApiVersion}`;
-            
-            await this.makeApiCall(url, 'POST');
-            
-            this.logSuccess(`${operationName} operation initiated for ${capacity.name}`);
-            
+            let completed = 0;
+            let failed = 0;
+
+            for (const idx of relevantIndices) {
+                const capacity = this.capacities[idx];
+                try {
+                    completed++;
+                    if (total > 1) {
+                        this.log(`${operationName} ${completed} of ${total}: ${capacity.name}...`);
+                    } else {
+                        this.log(`${operationName} capacity ${capacity.name}...`);
+                    }
+
+                    const url = `${this.baseUrl}${capacity.id}/${operation}?api-version=${this.fabricApiVersion}`;
+                    await this.makeApiCall(url, 'POST');
+
+                    this.logSuccess(`${operationName} operation initiated for ${capacity.name}`);
+                } catch (error) {
+                    failed++;
+                    this.logError(`Failed to ${operation} capacity ${capacity.name}`, error);
+                }
+            }
+
+            if (total > 1) {
+                this.log(`Batch ${operationName.toLowerCase()} complete: ${total - failed} succeeded, ${failed} failed`);
+            }
+
             // Refresh the capacity list to update status after a short delay
             setTimeout(async () => {
                 await this.refreshCapacities();
             }, 2000);
 
         } catch (error) {
-            this.logError(`Failed to ${operation} capacity ${capacity.name}`, error);
+            this.logError(`Failed to ${operation} capacities`, error);
         } finally {
             await this.setButtonsEnabled(true);
         }
@@ -1713,7 +2079,7 @@ class FabricCapacityManager {
      */
     async setButtonsEnabled(enabled) {
         if (enabled) {
-            await this.onCapacitySelectionChange(); // Re-evaluate button states
+            this.updateButtonStates();
             this.refreshButton.disabled = false;
         } else {
             this.startButton.disabled = true;

@@ -78,23 +78,79 @@
             cursor: wait;
         }
 
+        .capacity-list-toolbar {
+            display: flex;
+            align-items: center;
+            padding: 4px 8px;
+            background-color: #faf9f8;
+            border: 1px solid #8a8886;
+            border-bottom: none;
+            border-radius: 2px 2px 0 0;
+            gap: 6px;
+        }
+
+        .capacity-list-toolbar label {
+            font-size: 12px;
+            color: #605e5c;
+            cursor: pointer;
+            user-select: none;
+        }
+
         .capacity-list {
             min-height: 140px;
             max-height: 220px;
             overflow-y: auto;
             border: 1px solid #8a8886;
-            border-radius: 2px;
+            border-radius: 0 0 2px 2px;
             background-color: white;
         }
 
+        .category-header {
+            padding: 6px 10px;
+            background-color: #f3f2f1;
+            border-bottom: 1px solid #e1dfdd;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            cursor: default;
+            position: sticky;
+            top: 0;
+            z-index: 1;
+        }
+
+        .category-header .category-label {
+            font-size: 12px;
+            font-weight: 700;
+            color: #323130;
+            flex: 1;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .category-header .category-count {
+            font-size: 11px;
+            color: #605e5c;
+            font-weight: normal;
+        }
+
+        .category-checkbox,
+        .capacity-checkbox {
+            width: 14px;
+            height: 14px;
+            cursor: pointer;
+            accent-color: #0078d4;
+            flex-shrink: 0;
+        }
+
         .capacity-list-item {
-            padding: 8px 12px;
+            padding: 8px 12px 8px 28px;
             border-bottom: 1px solid #edebe9;
             cursor: pointer;
             transition: background-color 0.15s ease;
             display: flex;
-            justify-content: space-between;
             align-items: center;
+            gap: 8px;
         }
 
         .capacity-list-item:last-child {
@@ -108,13 +164,22 @@
         .capacity-list-item.selected {
             background-color: #deecf9;
             border-left: 3px solid #0078d4;
-            padding-left: 9px;
+            padding-left: 25px;
+        }
+
+        .capacity-list-item.checked-item {
+            background-color: #e8f4fd;
+        }
+
+        .capacity-list-item.selected.checked-item {
+            background-color: #deecf9;
         }
 
         .capacity-list-item.empty {
             color: #605e5c;
             font-style: italic;
             cursor: default;
+            padding-left: 12px;
         }
 
         .capacity-list-item.empty:hover {
@@ -410,6 +475,18 @@
             color: #D83B01;
             font-weight: 600;
         }
+
+        .cost-badge {
+            display: inline-block;
+            padding: 2px 6px;
+            border-radius: 2px;
+            font-size: 11px;
+            font-weight: 600;
+            background-color: #fff4ce;
+            color: #8a6914;
+            font-family: 'Consolas', 'Courier New', monospace;
+            margin-right: 8px;
+        }
     </style>
 </head>
 <body>
@@ -440,8 +517,14 @@
         </div>
         
         <div class="controls-container">
-            <div id="capacityList" class="capacity-list">
-                <div class="capacity-list-item empty">Select a capacity...</div>
+            <div>
+                <div class="capacity-list-toolbar" id="capacityListToolbar" style="display:none;">
+                    <input type="checkbox" id="selectAllCheckbox" class="category-checkbox" title="Select all capacities">
+                    <label for="selectAllCheckbox">Select All</label>
+                </div>
+                <div id="capacityList" class="capacity-list">
+                    <div class="capacity-list-item empty">Select a capacity...</div>
+                </div>
             </div>
             
             <div id="skuContainer">
